@@ -1,0 +1,12 @@
+#!/usr/bin/env sh
+# memtree 入口 —— 零依赖，不需要 pip install。
+# 解释器优先级：$MEMTREE_PY → python3 → python → py（Windows 的 launcher）。
+SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+MAIN="$SELF_DIR/../scripts/memtree.py"
+[ -f "$MAIN" ] || { echo "[memtree] 找不到 $MAIN" >&2; exit 127; }
+for c in "$MEMTREE_PY" python3 python py; do
+    [ -n "$c" ] || continue
+    command -v "$c" >/dev/null 2>&1 && exec "$c" "$MAIN" "$@"
+done
+echo "[memtree] 找不到可用的 Python 解释器：设置 MEMTREE_PY 指向 python 可执行文件" >&2
+exit 127

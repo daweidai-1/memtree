@@ -21,13 +21,35 @@
 | `outcome` | REAL，`[-1,1]`。进虚轴，只影响检索不影响覆盖 |
 | `subject` | 同类事件的键，决定谁和谁比 |
 | `v_text` | 128 维事件向量（稠密 ±1 随机投影，必须非稀疏） |
-| `type` | `event/fact/pref/decision/hypothesis/summary/merge` |
+| `type` | `event/fact/pref/decision/anchor/hypothesis/summary/merge` |
 | `scope` | `global`（跨分支共享）/ `branch` |
 | `factor` | 墓碑/压缩标记，`曾:美式@09-15` |
 | `refs` | 被强化次数（仅记录，不参与权重） |
 | `supersedes` / `superseded_by` | 覆盖链双向指针 |
-| `status` | `active / superseded / archived` |
+| `status` | `active / superseded / archived`（`competing` 为保留值，当前无写入路径） |
 | `branch` / `parent_id` | 分支与 DAG 前驱 |
+| `pinned` | INTEGER 0/1，保护位。1 = context 永不裁剪、compress 永不覆盖、purge 拒绝硬删 |
+| `accessed_at` | REAL，epoch 秒，最后一次被 `recall`/`signal` 碰过的时间。**只用于算热度，不累计次数** |
+| `label` | `anchor / emotional / noise / NULL`。**`settle` 的结算产物**：写入后不可由热度改写 |
+| `source_type` | `stated / roleplay / inferred / system`。`roleplay` 永不打情感锚点（防虚构污染） |
+
+### signals（采样队列）
+
+访问过程中采集的原始证据。**结算前不参与任何决策** —— 它的唯一作用是被 `settle` 消费。
+
+| 字段 | 说明 |
+|---|---|
+| `node_id` | 指向 nodes |
+| `type` | `user_confirm`（用户明说重要）/ `correction`（纠正过）/ `emotional_peak` / `repeat_mention` |
+| `intensity` | `emotional_peak` 的强度 0~1 |
+| `quote` | 用户原话，情感场景要用它保住金句 |
+| `settled` | 0 = 待结算，1 = 已结算并清空参与资格 |
+
+### settle_log（结算审计）
+
+没有这张表，"为什么这条被打成重要"就不可回答 —— 那和 LLM 黑箱没区别。
+
+`node_id, signal_types, old_pinned, new_pinned, old_label, new_label, reason, at`
 
 ### branches / kv
 
@@ -51,16 +73,71 @@
 - 只有 `active` 进 `context` 的 `■`。
 - `superseded` 只以 `factor` 出现在新记忆的括号里。
 - `purged` 的地址仍可用于**去重**和"曾经有过这条"的溯源，但取不回原文。
+- `pinned=1` 的节点不参与任何降级：`compress` 跳过它，`purge` 直接拒绝（要清先 `pin <id> --off`）。
+- `competing` 是保留状态位：用于「两条现状互相矛盾、等用户裁决」的场景，目前没有写入路径，`recall --status competing` 恒为空。
 
 ## 6. 权重
 
 ```
-w = 2^(-Δt/45天)        Δt = now - t
+w = 2^(-|Δt|/45天)      Δt = t_q - t        t_q = 检索时刻（默认 now，可 --at 指定）
 ```
 
-只用时间，越新越大，严格单调。同 `subject` 组内 `max(t, id)` 为现状，其余立即降级。
+取绝对值是对称的：过去越久越小，**未来越临近越大**——写错的未来时间戳（把 2026 打成 2030）不会永久霸榜。同 `subject` 组内 `max(t, id)` 为现状，其余立即降级。
 
 为什么不让可信度/结果值参与：一旦混入，就要定义"多少次确认能压过多新的改口"，规则会迅速变复杂且不可预测。**覆盖只回答"现在是什么"，其它维度只服务检索。**
+
+## 6.5 热度、保护位、锚点的分工
+
+| 概念 | 存在哪 | 决定什么 | 不决定什么 |
+|---|---|---|---|
+| 时间权重 `w` | 现算，不落盘 | 检索排序、context 里谁在前 | 谁进上下文（那由 status + pinned 决定） |
+| 热度 `heat` | `max(accessed_at, t)` 现算 | **只触发压缩**（`compress --heat`） | 排序、分区归属、压缩后去向 |
+| 采样 `signals` | `signals` 表 | 攒出「值得升保护位」的证据 | 任何即时决策（要等 `settle`） |
+| 保护位 `pinned` | `nodes.pinned` | 不被裁剪 / 不被压缩 / 不被硬删 | 排序（保护位不抬权重，只保命） |
+| 锚点 `type=anchor` | 一条普通节点 | 独立成段、永不裁剪、撞上更新的 fact 时标 `⚑锚点未变` | 吞掉新现状（新 fact 照样 active，只标出张力） |
+
+```
+heat = 0.5 ^ (距上次访问天数 / 45)     # 分母是「多久没碰」，不是「碰了几次」
+```
+
+三条硬规则：
+
+1. **热度是计时器，不是裁判。** 它不参与排序，排序看 `w × 语义 × 结果`。让它排序，一条被反复问到的旧偏好就会压过最近的改口，人格设定就漂了。
+2. **不累计次数。** 高频对话里所有条目都热、低频对话里全都冷——次数是环境的函数，不是记忆的函数。只看「距上次访问」。
+3. **写入即热区。** 刚 commit 的条目 `accessed_at` 为空、但 `t` 是现在，热度天然最高，不需要额外提升。
+4. **热度只能通过一次结算影响重要性。** 见下。
+
+### 6.6 采样 → 结算：热度唯一被允许影响保留的通道
+
+只有计时器的热度有个死穴：**没法区分"曾经重要、后来没人提"和"从来没重要过"**。两者到期时都是"冷了"。
+
+解法是让它同时当采样器，但**影响必须一次性兑现**：
+
+```
+访问 → 记一条 signal（零决策影响）
+     → settle 一次性结算 → label
+     → anchor/emotional：pinned=1（此后 heat 归零也不影响它）
+     → noise：豁免热度门，提前淘汰
+     → 清空 signals
+```
+
+| 采到的证据 | 判定条件 | label | 效果 |
+|---|---|---|---|
+| `user_confirm` | 用户明说"记住/重要" | `anchor` | `pinned=1`，永不压缩/裁剪/硬删 |
+| `correction` | 用户纠正过这条 | `anchor` | 同上 |
+| `emotional_peak` | 强度 ≥0.7 **且** `source_type=stated` | `emotional` | `pinned=1` |
+| `repeat_mention` | 只有重复，无以上三种 | `noise` | 豁免热度门，加速淘汰 |
+
+**为什么这不违反铁律三**：连续地延长寿命 = 裁判（隐式、不可审计）；一次性结算成状态 = 采样（显式、有 `settle_log`）。
+结算之后参与保留的东西已经从"热度"换成了 `pinned`，而 `pinned` 不会再变。
+
+三条防退化约束：
+
+1. `signals` **不得跨结算周期累积** —— 攒起来就变回"问得多就一直留着"。
+2. 判定走规则、不走 LLM；唯一用到模型的 `intensity` 也只输出离散档位。
+3. 每次结算必须写 `settle_log`，否则不可审计。
+
+保护位与锚点的区别：保护位是**行为标记**（别删我），锚点是**语义角色**（我是谁不许被最近一次对话改写）。关系里程碑这类「既重要又是身份锚点」的条目，两个都要打。
 
 ## 7. subject 命名
 

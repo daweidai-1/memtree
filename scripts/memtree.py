@@ -35,6 +35,7 @@ import re
 import sqlite3
 import struct
 import sys
+import unicodedata
 from datetime import datetime, timedelta
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -43,8 +44,9 @@ if hasattr(sys.stdout, "reconfigure"):
 
 # ------------------------------------------------------------------ 常量
 VEC_D = 128            # 事件（语义）向量维度：128 × float32 = 512B/条
-TAU_DAYS = 45.0        # 时间权重半衰期（天）：w = 2^(-Δt/45)，越新越大
+TAU_DAYS = 45.0        # 时间权重半衰期（天）：w = 2^(-|Δt|/45)，越新越大、未来封顶 1.0
 STATEFUL = ("fact", "pref", "decision")
+ANCHOR = "anchor"      # 硬锚点：身份/关系里程碑/安全约束。不参与覆盖、不压缩、不裁剪
 GLYPH = {"active": "●", "superseded": "◐", "archived": "○", "competing": "◆"}
 DEFAULT_DB = os.path.join(".workbuddy", "memory", "memtree.db")
 
@@ -65,10 +67,27 @@ DEFAULT_DB = os.path.join(".workbuddy", "memory", "memtree.db")
 
 
 def time_weight(t_m, t_q=None):
-    """时间量：查询时间唯一，所以它不做匹配，只做权重。Δt<0（未来）不计。"""
+    """时间量：查询时间唯一，所以它不做匹配，只做权重。
+
+    w = 2^(-|Δt|/45)：过去越久越低；未来越临近越高，但在"此刻"封顶为 1.0。
+    未来取绝对值而不是 clamp 成 0 —— clamp 会让一条年份写错的记忆（如 2030）
+    永久拿满权重霸占检索首位，实测过。
+    """
     t_q = t_q or datetime.now().timestamp()
-    dt_days = max(0.0, (t_q - t_m) / 86400.0)
-    return 0.5 ** (dt_days / TAU_DAYS)
+    return 0.5 ** (abs(t_q - t_m) / 86400.0 / TAU_DAYS)
+
+
+def heat_of(row, t_now=None):
+    """热度 = 计时器，不是裁判（SPEC §4.1 / 铁律三）。
+
+    只回答一个问题："这条有多久没被碰过了？" 只看距上次访问的时长，
+    绝不累计访问次数 —— 累计次数会让高频闲聊全部变热，正是铁律二禁止的裁判行为。
+    写入即热区（§3.4）：从没被访问过的条目，从它的写入时间开始衰减。
+    返回值只用于触发压缩（compress --heat），永远不进入排序。
+    """
+    t_now = t_now or datetime.now().timestamp()
+    last = max(float(row["accessed_at"] or 0.0), float(row["t"] or 0.0))
+    return 0.5 ** (max(0.0, t_now - last) / 86400.0 / TAU_DAYS)
 
 
 def l2(v):
@@ -80,16 +99,30 @@ def dot(a, b):
     return sum(x * y for x, y in zip(a, b))
 
 
+def _terms(text):
+    """切词：ASCII 单词 + 非 ASCII 文字段的单字符与相邻二元组。
+
+    随机投影词袋没有"意思相近"的能力，任何两段文字都会有非零余弦（噪声）。
+    所以召回侧还要用它算一次**词面重合**，把纯噪声的命中标出来。
+    """
+    s = (text or "").lower()
+    toks = re.findall(r"[a-z0-9_]+", s)
+    # 非 ASCII 文字段（汉字/假名/谚文/emoji…）统一按"单字符 + 相邻二元组"入袋。
+    # 只认 CJK 的话，假名·韩文·emoji 会退化成零向量 —— 情感对话里 emoji 密度很高，
+    # 而这些记忆会静默变成"召回恒 0 分"的死数据。
+    for seg in re.findall(r"[^\x00-\x7f]+", s):
+        chars = [ch for ch in seg if unicodedata.category(ch)[0] not in "PZC"]
+        toks += chars
+        toks += [chars[i] + chars[i + 1] for i in range(len(chars) - 1)]
+    return toks
+
+
 def text_vec(text, vec_d=None):
     """事件向量：每个 token 生成一条稠密 ±1 随机向量再叠加（随机投影式词袋）。
     必须稠密——稀疏哈希会让"没命中的维度"权重为 0，把另一维整段打空。"""
     d = vec_d or VEC_D
     v = [0.0] * d
-    s = (text or "").lower()
-    toks = re.findall(r"[a-z0-9_]+", s)
-    for seg in re.findall(r"[\u4e00-\u9fff]+", s):
-        toks += list(seg)
-        toks += [seg[i:i + 2] for i in range(len(seg) - 1)]
+    toks = _terms(text)
     if not toks:
         return [0.0] * d
     for t in toks:
@@ -119,7 +152,22 @@ def parse_ts(s):
     try:
         return datetime.fromisoformat(s)
     except ValueError:
+        pass
+    try:
         return datetime.strptime(str(s)[:19], "%Y-%m-%d %H:%M:%S").astimezone()
+    except ValueError:
+        sys.exit(f"[memtree] 时间格式无法解析：{s!r}"
+                 "（示例：2026-10-25 或 2026-10-25T09:30:00）")
+
+
+def _range(v, lo, hi, name):
+    """范围校验。越界值不报错就会污染排序：实测 --outcome 5 会让一条记忆长期霸榜。"""
+    if v is None:
+        return 0.0
+    v = float(v)
+    if not (lo <= v <= hi):
+        sys.exit(f"[memtree] {name} 超出范围 [{lo},{hi}]：{v}")
+    return v
 
 
 def short_date(ts, ref=None):
@@ -184,7 +232,11 @@ def _schema(conn):
             type          TEXT NOT NULL DEFAULT 'event',
             scope         TEXT NOT NULL DEFAULT 'global',
             factor        TEXT,                      -- 因子标记（墓碑/压缩）
-            refs          INTEGER NOT NULL DEFAULT 0,-- 被强化次数 → 可信度
+            refs          INTEGER NOT NULL DEFAULT 0,-- 被强化次数 → 可信度（不参与排序）
+            pinned        INTEGER NOT NULL DEFAULT 0,-- 保护位：不压缩、不硬删、不裁剪
+            accessed_at   REAL,                      -- 最近一次检索命中（热度代理，不参与排序）
+            label         TEXT,                      -- anchor|emotional|noise —— settle 结算产物
+            source_type   TEXT NOT NULL DEFAULT 'stated', -- stated|roleplay|inferred|system
             supersedes    INTEGER,
             superseded_by INTEGER,
             rolled_into   INTEGER,
@@ -198,6 +250,31 @@ def _schema(conn):
         CREATE INDEX IF NOT EXISTS idx_br  ON nodes(branch, t);
         CREATE INDEX IF NOT EXISTS idx_addr ON nodes(addr);
 
+        -- 采样：访问过程中采集的原始证据。结算前不参与任何决策。
+        CREATE TABLE IF NOT EXISTS signals(
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            node_id   INTEGER NOT NULL,
+            type      TEXT    NOT NULL,   -- user_confirm|correction|emotional_peak|repeat_mention
+            intensity REAL    NOT NULL DEFAULT 0,
+            quote     TEXT,
+            at        TEXT    NOT NULL,
+            settled   INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_sig ON signals(node_id, settled);
+
+        -- 结算审计：没有这张表，"为什么这条被打成重要"就不可回答
+        CREATE TABLE IF NOT EXISTS settle_log(
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            node_id     INTEGER NOT NULL,
+            signal_types TEXT,
+            old_pinned  INTEGER,
+            new_pinned  INTEGER,
+            old_label   TEXT,
+            new_label   TEXT,
+            reason      TEXT,
+            at          TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS branches(
             name TEXT PRIMARY KEY, fork_node INTEGER, head_id INTEGER,
             status TEXT NOT NULL DEFAULT 'open', merged_into TEXT, merged_at TEXT, created_at TEXT
@@ -205,7 +282,21 @@ def _schema(conn):
         CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY, v TEXT);
         """
     )
+    _migrate(conn)
     conn.execute("INSERT OR IGNORE INTO branches(name,status,created_at) VALUES('main','open',?)", (now_iso(),))
+    conn.commit()
+
+
+def _migrate(conn):
+    """老库补列。CREATE TABLE IF NOT EXISTS 不会给已存在的表加新列，
+    缺了这一步，升级后旧库上 pinned/accessed_at 全是 UndefinedColumn。"""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(nodes)")}
+    for name, ddl in (("pinned", "INTEGER NOT NULL DEFAULT 0"),
+                      ("accessed_at", "REAL"),
+                      ("label", "TEXT"),
+                      ("source_type", "TEXT NOT NULL DEFAULT 'stated'")):
+        if name not in cols:
+            conn.execute(f"ALTER TABLE nodes ADD COLUMN {name} {ddl}")
     conn.commit()
 
 
@@ -244,10 +335,13 @@ def emit(conn, obj, quiet=False):
 
 # ------------------------------------------------------------------ 权重
 def weight(node_row, now_epoch=None):
-    """权重只由时间决定：w = 2^(-Δt/τ)，越新越大，严格单调。"""
+    """权重只由时间决定：w = 2^(-|Δt|/τ)，越新越大，未来对称收敛到 1.0。
+
+    调用次数（refs）、访问热度（accessed_at）一律不进入这里 ——
+    铁律："球的位置由时间决定，不由调用次数决定"。热度只用于触发压缩。
+    """
     now_epoch = now_epoch or datetime.now().timestamp()
-    age_days = max(0.0, (now_epoch - node_row["t"]) / 86400.0)
-    return 0.5 ** (age_days / TAU_DAYS)
+    return 0.5 ** (abs(now_epoch - node_row["t"]) / 86400.0 / TAU_DAYS)
 
 
 # ------------------------------------------------------------------ 写入
@@ -267,19 +361,24 @@ def cmd_commit(conn, a):
     ts = a.ts or now_iso()
     t_epoch = parse_ts(ts).timestamp()
     ntype = a.type
-    scope = a.scope or ("global" if ntype in ("fact", "pref") else "branch")
+    scope = a.scope or ("global" if ntype in ("fact", "pref", ANCHOR) else "branch")
     subject = a.subject
-    outcome = float(a.outcome if a.outcome is not None else 0.0)
+    outcome = _range(a.outcome, -1.0, 1.0, "--outcome")
+    refs = int(a.refs or 0)
+    if refs < 0:
+        sys.exit(f"[memtree] --refs 不能为负：{refs}")
+    pinned = 1 if a.pinned else 0
 
     addr = _put_blob(conn, a.content)
     sem = text_vec(a.content)
 
     cur = conn.execute(
-        """INSERT INTO nodes(t,outcome,subject,addr,v_text,type,scope,factor,refs,
-                             status,branch,parent_id,meta,ts_iso)
-           VALUES(?,?,?,?,?,?,?,?,?, 'active', ?,?,?,?)""",
+        """INSERT INTO nodes(t,outcome,subject,addr,v_text,type,scope,factor,refs,pinned,
+                             status,branch,parent_id,meta,ts_iso,source_type)
+           VALUES(?,?,?,?,?,?,?,?,?,?, 'active', ?,?,?,?,?)""",
         (t_epoch, outcome, subject, addr, pack_real(sem),
-         ntype, scope, a.factor, int(a.refs or 0), bname, parent, a.meta, ts),
+         ntype, scope, a.factor, refs, pinned, bname, parent, a.meta, ts,
+         getattr(a, "source", None) or "stated"),
     )
     nid = cur.lastrowid
 
@@ -307,14 +406,152 @@ def cmd_commit(conn, a):
                 conn.execute("UPDATE nodes SET factor=?, supersedes=? WHERE id=?",
                              (fac, loser["id"], nid))
 
+    anchored = None
+    if ntype == ANCHOR and subject and not a.no_supersede:
+        # 锚点之间按时间覆盖（人格更新本来就要留痕），但与 fact/pref/decision 分组隔离：
+        # 身份不该被一句随手记下的偏好顶掉。
+        for r in conn.execute(
+            """SELECT * FROM nodes WHERE subject=? AND type=? AND status='active' AND id!=?
+               ORDER BY t DESC, id DESC""", (subject, ANCHOR, nid)):
+            conn.execute("UPDATE nodes SET status='superseded', superseded_by=? WHERE id=?", (nid, r["id"]))
+            conn.execute("UPDATE blobs SET hot=0 WHERE addr=?", (r["addr"],))
+        decision = "anchor-replace"
+    elif ntype in STATEFUL and subject:
+        anc = conn.execute(
+            """SELECT id FROM nodes WHERE subject=? AND type=? AND status='active'
+               ORDER BY t DESC, id DESC LIMIT 1""", (subject, ANCHOR)).fetchone()
+        if anc:
+            anchored = anc["id"]        # 现状可以变，锚点不动；由 context 显示张力
+
     conn.execute("UPDATE branches SET head_id=? WHERE name=?", (nid, bname))
     conn.commit()
     if a.quiet:
         print(nid)
     else:
-        emit(conn, {"id": nid, "branch": bname, "addr": addr, "type": ntype,
-                    "w": round(weight(node(conn, nid), datetime.now().timestamp()), 3),
-                    "decision": decision, "rival": rival})
+        out = {"id": nid, "branch": bname, "addr": addr, "type": ntype,
+               "w": round(weight(node(conn, nid), datetime.now().timestamp()), 3),
+               "decision": decision, "rival": rival}
+        if pinned:
+            out["pinned"] = True
+        if anchored:
+            out["anchored_by"] = anchored
+        emit(conn, out)
+
+
+def cmd_pin(conn, a):
+    """保护位：不压缩、不硬删、不裁剪（§5.4 保护位机制）。"""
+    node(conn, a.id)
+    conn.execute("UPDATE nodes SET pinned=? WHERE id=?", (0 if a.off else 1, a.id))
+    conn.commit()
+    emit(conn, {"id": a.id, "pinned": 0 if a.off else 1})
+
+
+# ------------------------------------------------------------------ 采样 → 结算（动态因子的第二职责）
+SIGNAL_TYPES = ("user_confirm", "correction", "emotional_peak", "repeat_mention")
+EMOTIONAL_GATE = 0.7        # 情绪强度过此线才算情感锚点
+
+
+def cmd_signal(conn, a):
+    """记一条采样信号。只入队、不做决策 —— 决策全部留给 settle。
+
+    这是动态因子的另一半：访问本身不改变任何保留时长，
+    它只是往采样队列里放一条证据（SPEC §4.1「按后续索引去安排重要性」）。
+    """
+    node(conn, a.node)
+    if a.type not in SIGNAL_TYPES:
+        sys.exit(f"[memtree] 未知信号类型: {a.type}（可选 {', '.join(SIGNAL_TYPES)}）")
+    conn.execute("INSERT INTO signals(node_id,type,intensity,quote,at,settled) VALUES(?,?,?,?,?,0)",
+                 (a.node, a.type, float(a.intensity or 0.0), a.quote, now_iso()))
+    conn.execute("UPDATE nodes SET accessed_at=? WHERE id=?",
+                 (datetime.now().timestamp(), a.node))
+    conn.commit()
+    pend = conn.execute("SELECT COUNT(*) c FROM signals WHERE node_id=? AND settled=0",
+                        (a.node,)).fetchone()["c"]
+    emit(conn, {"node": a.node, "signal": a.type, "pending": pend})
+
+
+def _judge(conn, nid):
+    """规则判定：signals → label。不调 LLM —— 四个信号都可判定。"""
+    rows = conn.execute("SELECT type, intensity FROM signals WHERE node_id=? AND settled=0",
+                        (nid,)).fetchall()
+    if not rows:
+        return None, "无信号"
+    types = {r["type"] for r in rows}
+    peak = max([float(r["intensity"] or 0) for r in rows if r["type"] == "emotional_peak"] or [0.0])
+    r = conn.execute("SELECT source_type FROM nodes WHERE id=?", (nid,)).fetchone()
+    src = (r["source_type"] if r and r["source_type"] else "stated")
+    if "user_confirm" in types:
+        return "anchor", "用户显式确认"
+    if "correction" in types:
+        return "anchor", "用户纠正过这条（说明重要）"
+    if peak >= EMOTIONAL_GATE and src == "stated":
+        return "emotional", f"情绪峰值 intensity={peak:.2f}"
+    if "emotional_peak" in types and src == "roleplay":
+        return None, "角色扮演内容，不进情感锚点（防虚构污染）"
+    if "repeat_mention" in types or peak > 0:
+        return "noise", "仅重复提及，未达情绪/确认阈值"
+    return None, "未达阈值"
+
+
+def cmd_settle(conn, a):
+    """日终结算：把未结算信号一次性转成 label，然后清空。
+
+    这是"访问可以影响保留"的唯一入口 —— 一次性、离散、留审计。
+    结算之后保护位就与热度彻底脱钩：heat_of 再怎么变，pinned 不动。
+    """
+    ids = [r["node_id"] for r in conn.execute(
+        "SELECT DISTINCT node_id FROM signals WHERE settled=0")]
+    changed = []
+    for nid in ids:
+        row = conn.execute("SELECT id,label,pinned FROM nodes WHERE id=?", (nid,)).fetchone()
+        if not row:
+            conn.execute("UPDATE signals SET settled=1 WHERE node_id=?", (nid,))
+            continue
+        label, reason = _judge(conn, nid)
+        old_pin, old_label = int(row["pinned"] or 0), row["label"]
+        new_pin = old_pin
+        if label in ("anchor", "emotional"):
+            new_pin = 1          # 复用保护位：不压缩、不硬删、不裁剪
+        if label:
+            conn.execute("UPDATE nodes SET label=?, pinned=? WHERE id=?", (label, new_pin, nid))
+            sig = ",".join(sorted({x["type"] for x in conn.execute(
+                "SELECT type FROM signals WHERE node_id=? AND settled=0", (nid,))}))
+            conn.execute(
+                """INSERT INTO settle_log(node_id,signal_types,old_pinned,new_pinned,
+                                          old_label,new_label,reason,at)
+                   VALUES(?,?,?,?,?,?,?,?)""",
+                (nid, sig, old_pin, new_pin, old_label, label, reason, now_iso()))
+            changed.append({"node": nid, "label": label, "pinned": new_pin, "reason": reason})
+        conn.execute("UPDATE signals SET settled=1 WHERE node_id=? AND settled=0", (nid,))
+    conn.commit()
+    if a.json:
+        emit(conn, {"scanned": len(ids), "changed": changed})
+    else:
+        if not changed:
+            print(f"[settle] 扫描 {len(ids)} 条，无一条达阈值")
+        for c in changed:
+            print(f"#{c['node']:<4} → {c['label']:<9} pinned={c['pinned']}  {c['reason']}")
+    return changed
+
+
+def cmd_label(conn, a):
+    """手动打标签。与 settle 同一条写入路径，同样留审计。"""
+    row = conn.execute("SELECT id,label,pinned FROM nodes WHERE id=?", (a.node,)).fetchone()
+    if not row:
+        sys.exit(f"[memtree] 节点不存在: #{a.node}")
+    lab = None if a.value in ("clear", "none", "null") else a.value
+    if lab not in (None, "anchor", "emotional", "noise"):
+        sys.exit("[memtree] label 只能是 anchor | emotional | noise | clear")
+    old_pin, old_label = int(row["pinned"] or 0), row["label"]
+    new_pin = 1 if lab in ("anchor", "emotional") else (0 if lab == "noise" else old_pin)
+    conn.execute("UPDATE nodes SET label=?, pinned=? WHERE id=?", (lab, new_pin, a.node))
+    conn.execute(
+        """INSERT INTO settle_log(node_id,signal_types,old_pinned,new_pinned,
+                                  old_label,new_label,reason,at)
+           VALUES(?,?,?,?,?,?,?,?)""",
+        (a.node, "manual", old_pin, new_pin, old_label, lab, a.reason or "手动标注", now_iso()))
+    conn.commit()
+    emit(conn, {"node": a.node, "label": lab, "pinned": new_pin})
 
 
 def cmd_reinforce(conn, a):
@@ -394,12 +631,30 @@ def cmd_context(conn, a):
     branch = a.branch or head_branch(conn)
     now_e = datetime.now().timestamp()
     ref = datetime.now().astimezone()
-    facts, branches, events = [], [], []
+    anchors, facts, branches, events = [], [], [], []
+
+    # 硬锚点（SPEC §6.3）：身份/关系里程碑/安全约束。独立成段、永不裁剪，
+    # 也不与现状混排 —— 「最近的状态」定义我现在是谁，「锚点」定义我始终是谁。
+    for r in _rows(conn, """SELECT * FROM nodes WHERE status='active' AND type=?
+                            AND (scope='global' OR branch=?)""", (ANCHOR, branch)):
+        anchors.append(f"⚓ {r['subject'] or '锚点'}: "
+                       f"{clip(content_of(conn, r['addr'], True), a.width)}")
 
     stateful = [r for r in _rows(conn, """SELECT * FROM nodes WHERE status IN ('active','competing')
                                           AND type IN ('fact','pref','decision')
                                           AND (scope='global' OR branch=?)""", (branch,))]
     wmap = _w(conn, stateful, now_e)
+    anchored_sub = {x["subject"] for x in conn.execute(
+        "SELECT subject FROM nodes WHERE type=? AND status='active'", (ANCHOR,))
+        if x["subject"]}
+
+    def mark(line, r):
+        # ★钉=保护位，永不被裁剪；⚑=该 subject 有锚点，现状与锚点并存要看得见
+        if r["pinned"]:
+            line += "  ★钉"
+        if (r["subject"] or "") in anchored_sub:
+            line += "  ⚑锚点未变"
+        return line
 
     # 冲突聚合：同 subject 下 >1 条待定
     by_sub = {}
@@ -417,7 +672,7 @@ def cmd_context(conn, a):
                 line = f"■ {sub}: {clip(content_of(conn, r['addr'], True), a.width)}"
                 if r["factor"]:
                     line += f"  ({r['factor']})"
-                facts.append(line)
+                facts.append(mark(line, r))
                 continue
         if any(x["status"] == "competing" for x in rs):
             parts = " ⟷ ".join(f"{clip(content_of(conn, x['addr'], True), 16)}({wmap[x['id']]:.2f})" for x in rs[:3])
@@ -448,33 +703,54 @@ def cmd_context(conn, a):
     n_all = conn.execute("SELECT COUNT(*) c FROM nodes").fetchone()["c"]
     n_cold = conn.execute("SELECT COUNT(*) c FROM nodes WHERE status!='active'").fetchone()["c"]
     head = conn.execute("SELECT head_id FROM branches WHERE name=?", (branch,)).fetchone()["head_id"]
-    legend = "※ ■现状 ◇假设 ○分支 ·事件  (曾:…@日期)=已废弃，禁止当作现状"
-    lines = [f"【记忆 {ref.strftime('%Y-%m-%d')} | {branch}#{head or '-'} | {n_all}节点·冷{n_cold}】"]
-    lines += facts + branches + events + legend.split("\n")
-
-    def size(ls):
-        return sum(len(x) + 1 for x in ls)
+    legend = ("※ ⚓锚点 ■现状 ★钉=保护位 ◇假设 ○分支(回顾点) ·事件"
+              "  (曾:…@日期)=已废弃，禁止当作现状")
+    head_line = (f"【记忆 {ref.strftime('%Y-%m-%d')} | {branch}#{head or '-'} "
+                 f"| {n_all}节点·冷{n_cold}】")
+    n_fact_all, n_ev_all = len(facts), len(events)
 
     def rebuild():
-        return [lines[0]] + facts + branches + events + legend.split("\n")
+        return [head_line] + anchors + facts + branches + events + legend.split("\n")
 
-    # 裁剪优先级：事件是时间轴的骨节，fact 是状态。
-    # 先保住最近的 keep_ev 条事件 → 再砍 fact → 最后才动保底事件。
-    # 原实现先砍 events 会把它砍光，输出退化成一坨静态事实、时间轴在上下文里消失。
+    def size():
+        return sum(len(x) + 1 for x in rebuild())
+
+    # 裁剪优先级：锚点 > 保护位 > 最近事件 > 普通现状 > 保底事件。
+    # 事件是时间轴的骨节、fact 是状态：先保住最近的 keep_ev 条事件，再砍普通 fact，
+    # 最后才动保底事件。原实现先砍 events 会把它砍光，上下文退化成静态事实、时间轴消失。
     keep_ev = min(max(a.recent, 0), len(events))
-    while size(rebuild()) > a.budget and len(events) > keep_ev:
-        events.pop(); lines = rebuild()
-    while size(rebuild()) > a.budget and len(facts) > 1:
-        facts.pop(); lines = rebuild()
-    while size(rebuild()) > a.budget and len(events) > 0:
-        events.pop(); lines = rebuild()
+    while size() > a.budget and len(events) > keep_ev:
+        events.pop()
+    while size() > a.budget:
+        cut = None
+        for i in range(len(facts) - 1, 0, -1):
+            if "★钉" not in facts[i]:      # 保护位永不裁剪
+                cut = i
+                break
+        if cut is None:
+            break
+        facts.pop(cut)
+    while size() > a.budget and len(events) > 0:
+        events.pop()
+
     out = "\n".join(rebuild())
+    # 静默丢状态是本项目最贵的 bug：模型看到 18 条就会笃定答「没记录过」。
+    # 溢出必须说出来 —— 宁可超预算一行，也不能让 Agent 以为自己看到了全部。
+    dropped = (n_fact_all - len(facts)) + (n_ev_all - len(events))
+    if dropped:
+        out += (f"\n⚠ 还有 {dropped} 条未展开"
+                f"（现状 {n_fact_all - len(facts)} / 事件 {n_ev_all - len(events)}）"
+                " —— 不要据此回答「没有记录」，用 recall 或 log --brief 查全")
     if a.json:
-        emit(conn, {"text": out, "chars": len(out), "est_tokens": est_tokens(out)})
+        emit(conn, {"text": out, "chars": len(out), "est_tokens": est_tokens(out),
+                    "shown": {"anchors": len(anchors), "facts": len(facts), "events": len(events)},
+                    "total": {"facts": n_fact_all, "events": n_ev_all},
+                    "dropped": dropped})
     else:
         print(out)
         if a.verbose:
-            print(f"\n[chars={len(out)} est_tokens≈{est_tokens(out)} budget={a.budget}]", file=sys.stderr)
+            print(f"\n[chars={len(out)} est_tokens≈{est_tokens(out)} budget={a.budget} "
+                  f"dropped={dropped}]", file=sys.stderr)
 
 
 def cmd_recall(conn, a):
@@ -533,17 +809,44 @@ def cmd_recall(conn, a):
         s = se * (st + so) if a.mode == "and" else se * (0.5 + 0.5 * st) + 0.3 * so
         hits.append((s, r, se, st, so))
     hits.sort(key=lambda x: -x[0])
+    # 语义完全不重合（se=0）时 Σ 也是 0：那不是命中，是噪声。
+    # 打 5 条 Σ=+0.000 的假命中，比说"没查到"更贵 —— 它会诱导模型编出解释。
+    hits = [h for h in hits if h[0] > 1e-9]
     top = hits[: a.top]
+
+    # 词面重合：随机投影词袋对"毫不相关"的两句话也会给出非零余弦，
+    # 那不是命中而是噪声。重合为 0 的命中必须标注，否则模型会拿噪声当证据。
+    qset = set(_terms(q_text))
+
+    def _ov(row):
+        tset = set(_terms(content_of(conn, row["addr"], False)))
+        return (len(qset & tset) / float(len(qset))) if qset else 0.0
+
+    ovmap = {row["id"]: _ov(row) for s, row, se, st, so in top}
+
+    if top:
+        # 访问热度（SPEC §4）：只记"距上次访问"，绝不累计调用次数 ——
+        # 累计次数会让高频闲聊全变热，正是铁律二禁止的那种裁判。
+        conn.executemany("UPDATE nodes SET accessed_at=? WHERE id=?",
+                         [(datetime.now().timestamp(), h[1]["id"]) for h in top])
+        conn.commit()
     if a.json:
         emit(conn, {"query": q_text, "t": a.at or now_iso(), "outcome": r_ref, "hits": [
             {"id": r["id"], "score": round(s, 3), "sem": round(se, 2), "time": round(st, 2),
              "out": round(so, 2), "status": r["status"],
-             "subject": r["subject"], "addr": r["addr"], "content": content_of(conn, r["addr"], True),
+             "subject": r["subject"], "addr": r["addr"],
+             "overlap": round(ovmap[r["id"]], 2),
+             "low_confidence": ovmap[r["id"]] == 0.0,
+             "content": content_of(conn, r["addr"], True),
              "ts": r["ts_iso"]} for s, r, se, st, so in top]})
         return
     if not top:
-        print("(无命中)")
+        print("(无命中) —— 记忆库里没有语义相关的条目，不要据此编造。"
+              "若确定记过，换关键词或放宽 --days / --status any 再试")
         return
+    if top and all(v == 0.0 for v in ovmap.values()):
+        print("(低置信) 没有任何词面重合 —— 下面的命中来自随机投影的噪声相似度，别当证据。")
+
     for s, r, se, st, so in top:
         if at_mode:                                  # 回溯视角：以"当时"论现状
             is_cur = r["id"] in cur_ids
@@ -554,7 +857,8 @@ def cmd_recall(conn, a):
             glyph = GLYPH.get(r["status"], "?")
         print(f"{bar(s)} #{r['id']:<3} {glyph} {short_date(r['t'])} "
               f"t·{st:.2f} r·{so:+.2f} sem{se:+.2f} Σ={s:+.3f} → "
-              f"{clip(content_of(conn, r['addr'], hot_only=not at_mode), a.width)} {flag}")
+              f"{clip(content_of(conn, r['addr'], hot_only=not at_mode), a.width)}"
+              f"{' 「无词面重合·低置信」' if ovmap[r['id']] == 0.0 else ''} {flag}")
 
 
 def bar(s):
@@ -625,11 +929,16 @@ def cmd_verify(conn, a):
 def cmd_purge(conn, a):
     """物理删除：正文从 blobs 移除，节点只留地址（悬空指针），不可恢复。"""
     if a.addr:
+        held = conn.execute("SELECT COUNT(*) c FROM nodes WHERE pinned=1 AND addr LIKE ?",
+                            (a.addr + "%",)).fetchone()["c"]
+        if held:
+            sys.exit(f"[memtree] 拒绝 purge：{held} 个打保护位的节点引用该地址（先 pin <id> --off）")
         cur = conn.execute("UPDATE blobs SET hot=2, content='' WHERE addr LIKE ?", (a.addr + "%",))
         conn.commit()
         emit(conn, {"purged_addr": a.addr, "rows": cur.rowcount})
         return
-    rows = conn.execute("SELECT addr FROM nodes WHERE status IN ('superseded','archived')").fetchall()
+    rows = conn.execute("SELECT addr FROM nodes WHERE status IN ('superseded','archived')"
+                        " AND pinned=0").fetchall()
     n = 0
     for r in rows:
         n += conn.execute("UPDATE blobs SET hot=2, content='' WHERE addr=? AND hot!=2", (r["addr"],)).rowcount
@@ -728,12 +1037,20 @@ def cmd_graph(conn, a):
 # ------------------------------------------------------------------ 压缩 / 维护
 def cmd_compress(conn, a):
     cut = parse_ts(a.before).timestamp() if a.before else datetime.now().timestamp() - a.days * 86400
+    br = a.branch or head_branch(conn)
     keep = set()
     for b in conn.execute("SELECT fork_node, head_id FROM branches"):
         keep.update(x for x in (b["fork_node"], b["head_id"]) if x)
+    # pinned 走不到这层压缩：保护位永远只做 1~2 级压缩，不自动归档（SPEC §5.4）
+    t_now = datetime.now().timestamp()
     rows = [r for r in _rows(conn)
             if r["status"] == "active" and r["type"] == "event" and r["t"] < cut
-            and r["branch"] == a.branch and r["id"] not in keep]
+            and r["branch"] == br and r["id"] not in keep and not r["pinned"]
+            # 热度门（§4.1）：热度是计时器 —— 只有"久没被碰过"的候选才准压缩。
+            # 最近被 recall 命中过的老事件热度仍高，会被这一条挡下来。
+            # label='noise' 是结算产物：只有重复提及、没到情绪/确认阈值。
+            # 它豁免热度门 —— 不是放宽标准，而是加速淘汰（§3.3）。
+            and (a.heat is None or r["label"] == "noise" or heat_of(r, t_now) <= a.heat)]
     if len(rows) < a.min_count:
         emit(conn, {"compressed": 0, "candidates": [r["id"] for r in rows]})
         return
@@ -747,7 +1064,7 @@ def cmd_compress(conn, a):
                              status,branch,parent_id,meta,ts_iso)
            VALUES(?,0,NULL,?,?,'summary','global',?, 'active',?,?,?,?)""",
         (t0, addr, pack_real(text_vec(body)),
-         f"压:{span}/{len(rows)}条", a.branch, rows[0]["parent_id"],
+         f"压:{span}/{len(rows)}条", br, rows[0]["parent_id"],
          json.dumps({"rolled": len(rows), "ids": [r["id"] for r in rows]}), now_iso()))
     sid = cur.lastrowid
     for r in rows:
@@ -755,6 +1072,16 @@ def cmd_compress(conn, a):
         conn.execute("UPDATE blobs SET hot=0 WHERE addr=?", (r["addr"],))
     conn.commit()
     emit(conn, {"summary_node": sid, "rolled": len(rows), "span": span, "text": body})
+
+
+def _heat_hist(conn):
+    """热度分布：让"哪些旧了、哪些还被用到"变成可观测的事实，而不是感觉。"""
+    t_now = datetime.now().timestamp()
+    buckets = {"hot(>0.5)": 0, "warm(0.1~0.5)": 0, "cold(<=0.1)": 0}
+    for r in conn.execute("SELECT t, accessed_at FROM nodes WHERE status='active'"):
+        h = heat_of(r, t_now)
+        buckets["hot(>0.5)" if h > 0.5 else "warm(0.1~0.5)" if h > 0.1 else "cold(<=0.1)"] += 1
+    return buckets
 
 
 def cmd_stats(conn, a):
@@ -767,8 +1094,15 @@ def cmd_stats(conn, a):
         "blobs": {"hot": g("SELECT COUNT(*) c FROM blobs WHERE hot=1")[0]["c"],
                   "cold": g("SELECT COUNT(*) c FROM blobs WHERE hot=0")[0]["c"],
                   "purged": g("SELECT COUNT(*) c FROM blobs WHERE hot=2")[0]["c"]},
+        "protected": {"pinned": g("SELECT COUNT(*) c FROM nodes WHERE pinned=1")[0]["c"],
+                      "anchor": g("SELECT COUNT(*) c FROM nodes WHERE type='anchor'"
+                                  " AND status='active'")[0]["c"]},
+        "heat": _heat_hist(conn),
+        "by_label": {r["label"] or "null": r["c"]
+                     for r in g("SELECT label,COUNT(*) c FROM nodes GROUP BY label")},
+        "pending_signals": g("SELECT COUNT(*) c FROM signals WHERE settled=0")[0]["c"],
         "vec_dims": VEC_D,
-        "note": "冷/已清除的正文不在检索与上下文路径上，只留地址",
+        "note": "热度只用于触发压缩（§4.1），不参与排序；锚点/保护位不压缩、不裁剪、不硬删",
     })
 
 
@@ -801,7 +1135,8 @@ def main(argv=None):
     s.add_argument("content")
     s.add_argument("--subject", help="同一主体参与权重比较")
     s.add_argument("--type", default="event",
-                   choices=["event", "fact", "pref", "decision", "hypothesis", "summary", "merge"])
+                   choices=["event", "fact", "pref", "decision", "hypothesis", "summary", "merge",
+                            ANCHOR])
     s.add_argument("--outcome", type=float, help="结果值 [-1,1]：+成功/有效，-失败/无效")
     s.add_argument("--refs", type=int, default=0, help="初始可信度引用次数（重复陈述可累加）")
     s.add_argument("--scope", choices=["global", "branch"])
@@ -811,7 +1146,25 @@ def main(argv=None):
     s.add_argument("--ts")
     s.add_argument("--meta")
     s.add_argument("--no-supersede", action="store_true")
+    s.add_argument("--source", default="stated",
+                   choices=["stated", "roleplay", "inferred", "system"],
+                   help="内容来源；roleplay 不进情感锚点")
+    s.add_argument("--pin", dest="pinned", action="store_true",
+                   help="打保护位：永不压缩归档、永不硬删、永不从 context 裁剪")
     s.add_argument("--quiet", "-q", action="store_true")
+
+    s = add("signal", cmd_signal, "记一条采样信号（只入队，不做决策）")
+    s.add_argument("node", type=int)
+    s.add_argument("--type", required=True, choices=list(SIGNAL_TYPES))
+    s.add_argument("--intensity", type=float, default=0.0)
+    s.add_argument("--quote", help="用户原话（关键金句）")
+
+    s = add("settle", cmd_settle, "日终结算：signals → label（一次性 + 审计）")
+    s.add_argument("--json", action="store_true")
+
+    s = add("label", cmd_label, "手动打标签 anchor|emotional|noise|clear")
+    s.add_argument("node", type=int); s.add_argument("value")
+    s.add_argument("--reason")
 
     s = add("reinforce", cmd_reinforce, "强化一条记忆（提升可信度权重）")
     s.add_argument("id", type=int)
@@ -859,6 +1212,10 @@ def main(argv=None):
     s = add("purge", cmd_purge, "物理删除已覆盖记忆的正文，只留地址")
     s.add_argument("--addr")
 
+    s = add("pin", cmd_pin, "打/取消保护位（重要但低频的冷信息）")
+    s.add_argument("id", type=int)
+    s.add_argument("--off", action="store_true", help="取消保护位")
+
     s = add("graph", cmd_graph, "输出 Mermaid 图")
     s.add_argument("--style", default="git", choices=["git", "flow"])
     s.add_argument("--all", action="store_true")
@@ -866,7 +1223,9 @@ def main(argv=None):
     s = add("compress", cmd_compress, "旧事件压缩成摘要")
     s.add_argument("--before"); s.add_argument("--days", type=int, default=30)
     s.add_argument("--min-count", type=int, default=3); s.add_argument("--text")
-    s.add_argument("--branch", default="main")
+    s.add_argument("--heat", type=float,
+                   help="热度门（0~1）：只压缩热度低于该值的候选；不填则只按时间裁")
+    s.add_argument("--branch", help="默认跟随当前 HEAD（原实现写死 main，exp 分支的旧事件永远压不到）")
 
     s = add("stats", cmd_stats, "统计")
     s = add("export", cmd_export, "导出 JSON")

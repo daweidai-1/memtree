@@ -7,7 +7,7 @@
 [![Deps](https://img.shields.io/badge/dependencies-0-brightgreen)]()
 [![Self-test](https://img.shields.io/badge/self--test-20%2F20-success)]()
 
-> A timeline-first memory layer for AI agents. Old state is superseded by time, not by an LLM vote. 530 bytes per memory, ~550 tokens per turn, zero dependencies.
+> A timeline-first memory layer for AI agents. Old state is superseded by time, not by an LLM vote. 530 bytes per memory, ~360 tokens per turn, zero dependencies.
 
 ---
 
@@ -76,6 +76,31 @@ addr = sha256(content)[:16]
 
 ---
 
+### D4　动态因子是采样器，不只是计时器
+
+纯计时器有个死穴：**没法区分"曾经重要、后来没人提"和"从来没重要过"** —— 两者到期时都是"冷了"。
+
+所以热度同时当采样器，但**影响必须一次性兑现**：
+
+```
+访问 → signal（零决策影响）
+     → settle 一次性结算 → label
+     → anchor / emotional：pinned=1（此后 heat 归零也不影响它）
+     → noise：豁免热度门，提前淘汰
+     → signals 清空
+```
+
+| 采到的证据 | 判成 | 效果 |
+|---|---|---|
+| `user_confirm` / `correction` | `anchor` | 自动拿保护位（不压缩/不裁剪/不硬删） |
+| `emotional_peak` ≥0.7 且 `stated` | `emotional` | 自动拿保护位 |
+| 只有 `repeat_mention` | `noise` | 豁免热度门，加速淘汰 |
+
+**为什么这仍然满足"热度不做裁判"**：连续地延长寿命 = 裁判（隐式、不可审计）；一次性结算成状态 = 采样（显式，有 `settle_log`）。
+结算之后参与保留的东西已经从热度换成了 `pinned`，而 `pinned` 不会再变。
+
+判定全程走规则、不调 LLM；`source_type=roleplay` 的内容情绪再高也不会被打成情感锚点——防的是"角色扮演台词污染事实库"。
+
 ## 实测
 
 22 条记忆的库，实测输出（可复现，见下方「自检」）：
@@ -83,30 +108,32 @@ addr = sha256(content)[:16]
 | 项 | 数值 |
 |---|---|
 | 单条记忆存储 | ~530 字节（t 8B + r 8B + 向量 512B） |
-| `context` 每轮注入 | **554 token**（596 字符） |
-| `recall --top 5` 一次 | 381 token |
-| `log --brief` 一次 | 1,044 token |
-| `log --brief --width 28` 一次 | **696 token** |
-| `log` 默认（含地址/权重） | 1,357 token |
-| `show` 单条 | 131 token |
-| **SKILL.md（每次会话加载）** | **~1,400 token** |
+| `context` 每轮注入 | **358 token**（546 字符，budget 650） |
+| `recall --top 5` 一次 | 182 token |
+| `log --brief` 一次 | 323 token |
+| `log` 默认（含地址/权重） | 622 token |
+| `show` 单条 | 87 token |
+| `stats` 一次 | 180 token |
+| **SKILL.md（每次会话加载）** | **~2,130 token** |
+
+> 数字用 `memtree.est_tokens()` 量的（中文 1.5 token/字、ASCII 0.3 token/字符），别拿 `len/1.4` 复现——那对中文低估 40% 以上。测量脚本的做法：建 22 条种子记忆（含锚点、保护位、emoji 各一条），把各命令的 stdout 灌进 `est_tokens()`。
 
 ### 和"什么都不做"比
 
 | | 无记忆 | memtree |
 |---|---|---|
-| 每轮上下文 | `2000 + 600n`，随轮数线性涨 | **恒定 ~554** |
+| 每轮上下文 | `2000 + 600n`，随轮数线性涨 | **恒定 ~358** |
 | 撞 150K 上限 | 第 **247** 轮 | 不会 |
-| 累计成本交叉点 | — | **第 25 轮**（短于 25 轮用它纯亏） |
-| 第 200 轮累计 token | 12.46M | 1.94M（**省 84%**） |
+| 累计成本交叉点 | — | 不计抽取：第 3 轮；计入抽取（每次约 1.4K token、每轮 1~3 条）：约第 15~25 轮 |
+| 第 200 轮累计 token | 12.46M | 0.47M（**省 96%**） |
 
-> 25 轮这个拐点值得记住：**短对话不该用记忆层**，它是有明确最小适用长度的。
+>拐点值得记住：**短对话不该用记忆层**。注入量本身第 3 轮就回本，真正把拐点推后的是写入侧那次抽取调用——所以几轮问答别用它，几十轮以上才划算。
 
 ### 一个容易忽略的账
 
 `SKILL.md` 每次会话都要加载。Agent 不像人，它每个新会话都从零开始 —— 所以"文档写得详细"在人眼里是优点，在 Agent 眼里是**每次会话都要重付的税**。
 
-本项目为此做过一次专项瘦身：`SKILL.md` 从 3,323 → **1,406 token（−58%）**，数学推导移到 `references/theory.md` 按需读取，可用信息一条没少。
+本项目为此做过一次专项瘦身：`SKILL.md` 从 3,323 → **1,400 token 量级（−58%）**，数学推导移到 `references/theory.md` 按需读取，可用信息一条没少。之后补命令入口、锚点与保护位写法又长回来一些，当前实测 ~2,130 token——这份税按会话付一次，不再随对话长度涨。
 
 ---
 
@@ -199,6 +226,8 @@ $M graph --style git              # 输出 Mermaid 图
 | `log` | 时间轴；`--brief` 精简、`--all` 含归档 |
 | `show` / `verify` | 详情 + 覆盖链 / 地址校验 |
 | `branch` / `checkout` / `merge` | 分叉 / 切换 / 合并归档 |
+| `signal` / `settle` | 采样入队 / 一次性结算成 label（带审计） |
+| `label` / `pin` | 手动打标签 / 保护位开关 |
 | `compress` / `purge` | 旧事件压缩 / 正文物理删除 |
 | `graph` / `stats` / `export` | 出图 / 统计 / 导出 |
 
@@ -226,7 +255,7 @@ DB 默认 `./.workbuddy/memory/memtree.db`，用 `MEMTREE_DB` 覆盖（按项目
 bash scripts/selftest.sh
 ```
 
-20 项，覆盖：时间覆盖 / 乱序补录 / 三维检索 / 内容寻址 / 分支 / context 预算 / 压缩 / 物理清除 / 出图。
+37 项，覆盖：时间覆盖 / 乱序补录 / 三维检索 / 内容寻址 / 分支 / context 预算 / 压缩 / 物理清除 / 出图 / 参数校验 / 未来时间戳 / 保护位 / 硬锚点 / 非 ASCII 向量 / 热度计时器。
 
 ```
 [1] 时间权重覆盖（越新越大）        ok ×4
@@ -238,7 +267,13 @@ bash scripts/selftest.sh
 [7] 压缩                            ok ×2
 [8] 物理清除                        ok ×1
 [9] 出图                            ok ×2
-通过 20 / 失败 0
+[10] 参数校验（脏值当场拒绝）         ok ×3
+[11] 未来时间戳不得霸榜              ok ×1
+[12] 保护位（不裁剪/不压缩/不硬删）   ok ×5
+[13] 硬锚点（不被现状吞掉）          ok ×3
+[14] 非 ASCII（emoji/假名）           ok ×2
+[15] 热度只做压缩计时器              ok ×3
+通过 52 / 失败 0
 ```
 
 ---
@@ -247,16 +282,19 @@ bash scripts/selftest.sh
 
 ```
 memory-timeline/
-├── SKILL.md              # Agent 入口（~1200 token，精简到只留操作信息）
+├── SKILL.md              # Agent 入口（~2,100 token，精简到只留操作信息）
 ├── README.md             # 本文件
 ├── LICENSE               # MIT
+├── bin/
+│   ├── memtree           # POSIX 入口（MEMTREE_PY → python3 → python → py）
+│   └── memtree.cmd       # Windows 入口
 ├── references/
 │   ├── theory.md         # 数学推导（复平面模型、打分分解、时间旅行）
 │   ├── schema.md         # 表结构、状态机、subject 命名、换真嵌入的方法
 │   └── prompts.md        # 注入模板与抽取提示词
 └── scripts/
     ├── memtree.py        # 全部实现，单文件，零依赖
-    └── selftest.sh       # 20 项自检
+    └── selftest.sh       # 37 项自检
 ```
 
 ---
