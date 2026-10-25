@@ -1,0 +1,9 @@
+# 统一用 LF：shell 脚本在 Windows 上被转成 CRLF 后，Linux 上会报 $'\r': command not found
+* text=auto eol=lf
+*.sh text eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+
+# 数据库是二进制，别做行尾转换
+*.db binary
