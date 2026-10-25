@@ -220,9 +220,9 @@ $M graph --style git              # 输出 Mermaid 图
 
 | 命令 | 作用 |
 |---|---|
-| `commit` | 写入；`--subject --outcome --type --ts --refs` |
+| `commit` | 写入；`--subject --event --outcome --type --ts --refs --pin` |
 | `context` | 生成压缩记忆块；`--budget 650 --recent 3 --json --verbose` |
-| `recall` | 定位；`--at --outcome --days --mode --status --top` |
+| `recall` | 定位；`--at --outcome --days --event --mode --status --top` |
 | `log` | 时间轴；`--brief` 精简、`--all` 含归档 |
 | `show` / `verify` | 详情 + 覆盖链 / 地址校验 |
 | `branch` / `checkout` / `merge` | 分叉 / 切换 / 合并归档 |
@@ -273,7 +273,7 @@ bash scripts/selftest.sh
 [13] 硬锚点（不被现状吞掉）          ok ×3
 [14] 非 ASCII（emoji/假名）           ok ×2
 [15] 热度只做压缩计时器              ok ×3
-通过 52 / 失败 0
+通过 60 / 失败 0
 ```
 
 ---
@@ -294,7 +294,7 @@ memory-timeline/
 │   └── prompts.md        # 注入模板与抽取提示词
 └── scripts/
     ├── memtree.py        # 全部实现，单文件，零依赖
-    └── selftest.sh       # 37 项自检
+    └── selftest.sh       # 60 项自检
 ```
 
 ---

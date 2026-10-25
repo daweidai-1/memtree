@@ -236,6 +236,7 @@ def _schema(conn):
             pinned        INTEGER NOT NULL DEFAULT 0,-- 保护位：不压缩、不硬删、不裁剪
             accessed_at   REAL,                      -- 最近一次检索命中（热度代理，不参与排序）
             label         TEXT,                      -- anchor|emotional|noise —— settle 结算产物
+            event         TEXT,                      -- 所属事件（SPEC §2.2：记忆挂在事件下，事件是时间轴上的骨节）
             source_type   TEXT NOT NULL DEFAULT 'stated', -- stated|roleplay|inferred|system
             supersedes    INTEGER,
             superseded_by INTEGER,
@@ -283,6 +284,9 @@ def _schema(conn):
         """
     )
     _migrate(conn)
+    # 索引必须等补列之后再建：老库上 nodes(event) 还不存在，在 executescript 里建会当场报错，
+    # 连带整段 schema 脚本回滚 —— 升级即崩，比缺功能更糟。
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ev ON nodes(event)")
     conn.execute("INSERT OR IGNORE INTO branches(name,status,created_at) VALUES('main','open',?)", (now_iso(),))
     conn.commit()
 
@@ -294,6 +298,7 @@ def _migrate(conn):
     for name, ddl in (("pinned", "INTEGER NOT NULL DEFAULT 0"),
                       ("accessed_at", "REAL"),
                       ("label", "TEXT"),
+                      ("event", "TEXT"),
                       ("source_type", "TEXT NOT NULL DEFAULT 'stated'")):
         if name not in cols:
             conn.execute(f"ALTER TABLE nodes ADD COLUMN {name} {ddl}")
@@ -368,16 +373,20 @@ def cmd_commit(conn, a):
     if refs < 0:
         sys.exit(f"[memtree] --refs 不能为负：{refs}")
     pinned = 1 if a.pinned else 0
+    # 事件不是自由命名，是聚合键（SPEC §2.2）：长句当事件名会让聚合层退化成第二个 subject。
+    ev = re.sub(r"\s+", "_", (a.event or "").strip())
+    if ev and len(ev) > 24:
+        sys.exit(f"[memtree] --event 太长（{len(ev)}>24）：事件是聚合节点，请用短标签（如 换工作/搬家）")
 
     addr = _put_blob(conn, a.content)
     sem = text_vec(a.content)
 
     cur = conn.execute(
         """INSERT INTO nodes(t,outcome,subject,addr,v_text,type,scope,factor,refs,pinned,
-                             status,branch,parent_id,meta,ts_iso,source_type)
-           VALUES(?,?,?,?,?,?,?,?,?,?, 'active', ?,?,?,?,?)""",
+                             event,status,branch,parent_id,meta,ts_iso,source_type)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?, 'active', ?,?,?,?,?)""",
         (t_epoch, outcome, subject, addr, pack_real(sem),
-         ntype, scope, a.factor, refs, pinned, bname, parent, a.meta, ts,
+         ntype, scope, a.factor, refs, pinned, ev or None, bname, parent, a.meta, ts,
          getattr(a, "source", None) or "stated"),
     )
     nid = cur.lastrowid
@@ -654,6 +663,8 @@ def cmd_context(conn, a):
             line += "  ★钉"
         if (r["subject"] or "") in anchored_sub:
             line += "  ⚑锚点未变"
+        if r["event"]:                      # 事件标签：这条现状属于时间轴上的哪一节
+            line += f"  ⟦{r['event']}⟧"
         return line
 
     # 冲突聚合：同 subject 下 >1 条待定
@@ -688,6 +699,19 @@ def cmd_context(conn, a):
                             (branch,))):
         facts.append(f"◇ {r['subject'] or '假设'}: {clip(content_of(conn, r['addr'], True), a.width)}")
 
+    # 事件轴（SPEC §2.2）：记忆挂在事件下，先看事件、再展开细节。
+    # 跨期事件用时间区间表达 —— 同一件事聊了三次，是一个事件、三个时间点，不是三条无关记忆。
+    evl = []
+    _evrows = list(conn.execute(
+        """SELECT event ev, MIN(t) t0, MAX(t) t1, COUNT(*) c FROM nodes
+           WHERE event IS NOT NULL AND status IN ('active','competing')
+             AND (scope='global' OR branch=?)
+           GROUP BY event ORDER BY t1 DESC""", (branch,)))
+    for e in _evrows[:8]:
+        evl.append(f"▣ {e['ev']} {short_date(e['t0'], ref)}~{short_date(e['t1'], ref)} {e['c']}条")
+    if len(_evrows) > 8:                    # 显式说出还有多少，绝不静默截断
+        evl.append(f"▣ …还有 {len(_evrows) - 8} 个事件（recall --event <名> 查）")
+
     for b in conn.execute("SELECT * FROM branches WHERE status='open' AND name!=? ORDER BY created_at", (branch,)):
         h = conn.execute("SELECT * FROM nodes WHERE id=?", (b["head_id"],)).fetchone() if b["head_id"] else None
         tip = clip(content_of(conn, h["addr"], True), 30) if h else "(空)"
@@ -703,14 +727,14 @@ def cmd_context(conn, a):
     n_all = conn.execute("SELECT COUNT(*) c FROM nodes").fetchone()["c"]
     n_cold = conn.execute("SELECT COUNT(*) c FROM nodes WHERE status!='active'").fetchone()["c"]
     head = conn.execute("SELECT head_id FROM branches WHERE name=?", (branch,)).fetchone()["head_id"]
-    legend = ("※ ⚓锚点 ■现状 ★钉=保护位 ◇假设 ○分支(回顾点) ·事件"
+    legend = ("※ ⚓锚点 ■现状 ▣事件轴 ⟦事件名⟧ ★钉=保护位 ◇假设 ○分支(回顾点) ·事件"
               "  (曾:…@日期)=已废弃，禁止当作现状")
     head_line = (f"【记忆 {ref.strftime('%Y-%m-%d')} | {branch}#{head or '-'} "
                  f"| {n_all}节点·冷{n_cold}】")
     n_fact_all, n_ev_all = len(facts), len(events)
 
     def rebuild():
-        return [head_line] + anchors + facts + branches + events + legend.split("\n")
+        return [head_line] + anchors + facts + evl + branches + events + legend.split("\n")
 
     def size():
         return sum(len(x) + 1 for x in rebuild())
@@ -799,6 +823,8 @@ def cmd_recall(conn, a):
             continue
         if a.branch and not (r["branch"] == a.branch or r["scope"] == "global"):
             continue
+        if a.event and (r["event"] or "") != a.event:   # 事件层过滤：先按事件剪枝，再算相似度
+            continue
         # 不硬性过滤"未来"：事件的结果可能在事后才确定。
         # "当时的状态"由上面的 cur_ids 保证（同 subject 只留 t≤t_ref 的最大者）。
         if a.days is not None and (t_ref - r["t"]) / 86400.0 > a.days:
@@ -834,7 +860,7 @@ def cmd_recall(conn, a):
         emit(conn, {"query": q_text, "t": a.at or now_iso(), "outcome": r_ref, "hits": [
             {"id": r["id"], "score": round(s, 3), "sem": round(se, 2), "time": round(st, 2),
              "out": round(so, 2), "status": r["status"],
-             "subject": r["subject"], "addr": r["addr"],
+             "subject": r["subject"], "event": r["event"], "addr": r["addr"],
              "overlap": round(ovmap[r["id"]], 2),
              "low_confidence": ovmap[r["id"]] == 0.0,
              "content": content_of(conn, r["addr"], True),
@@ -858,6 +884,7 @@ def cmd_recall(conn, a):
         print(f"{bar(s)} #{r['id']:<3} {glyph} {short_date(r['t'])} "
               f"t·{st:.2f} r·{so:+.2f} sem{se:+.2f} Σ={s:+.3f} → "
               f"{clip(content_of(conn, r['addr'], hot_only=not at_mode), a.width)}"
+              f"{' ⟦' + r['event'] + '⟧' if r['event'] else ''}"
               f"{' 「无词面重合·低置信」' if ovmap[r['id']] == 0.0 else ''} {flag}")
 
 
@@ -1134,6 +1161,7 @@ def main(argv=None):
     s = add("commit", cmd_commit, "写入一条记忆（三维 + 内容寻址 + 权重覆盖）")
     s.add_argument("content")
     s.add_argument("--subject", help="同一主体参与权重比较")
+    s.add_argument("--event", help="所属事件标签（受控短标签 ≤24 字；同一件事的多次提及共用一个事件名）")
     s.add_argument("--type", default="event",
                    choices=["event", "fact", "pref", "decision", "hypothesis", "summary", "merge",
                             ANCHOR])
@@ -1192,6 +1220,7 @@ def main(argv=None):
     s.add_argument("--at", help="以哪个时间点为基准（默认现在），如 2026-09-15")
     s.add_argument("--outcome", type=float, help="期望结果值 [-1,1]")
     s.add_argument("--days", type=float, help="时间窗：只要 ±N 天内")
+    s.add_argument("--event", help="只在此事件内检索（先剪枝，再算相似度）")
     s.add_argument("--mode", default="and", choices=["and", "mix"],
                    help="and=内积定位（默认），mix=语义优先（时间只做微调）")
     s.add_argument("--branch"); s.add_argument("--top", type=int, default=5)
