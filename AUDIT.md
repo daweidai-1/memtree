@@ -33,7 +33,7 @@
 | §7 情感层 | **部分**（本轮结构化） | `affect` 独立表（`cmd_affect()` :633、建表 :306/:407）：`tags/intensity/valence/key_quote/source` 全落库；`signal --tags/--valence` → `settle` 聚合；固定 8 类 + `unspecified`；`recall --emotion` 激活情绪权重（α 默认 0.5，时间占 1-α）；`roleplay` 双入口拒绝；`purge` 级联删 `affect`。自检 [32] 18 条 | 情绪还没有常驻进 `context` 的情感状态段；标签仍由外部 Agent 给，没有自动打标/LLM 抽取 |
 | §8.1 上下文组装 | **部分** | 组装顺序固定：锚点 → 现状 → 分支 → 事件 → 图例 → `⏳` 未来段；硬预算；溢出显式标记（:1000） | 不含情感状态层、不含 3~5 条热记忆预取、滑窗归 Agent 侧 |
 | §8.3 分层检索 | **部分**（v2 灰度） | `recall --pipeline v2`（`cmd_recall()` :1450）：有效性门 → 时间窗 → 事件过滤 → `0.85*cos+0.15*lexical` 混合 → 时间/情绪加权 → 事件单元展开；`pipeline` 每级报 `in/pruned/out`，未来单列 `future_hidden`；`--at` 锚定 T。自检 [33] 15 条 | 默认仍是 `legacy`，v2 尚未成为默认；事件级独立权重/秩位衰减仍未做 |
-| §9 落地选型 | **部分** | SQLite 元数据 ✅、单文件零依赖 ✅、CLI+JSON 工具接口 ✅ | 原文没有落到文件系统（在 `blobs` 里）、没用 FTS5/sqlite-vec、无后台调度（没有日终 consolidation）、无 MCP 封装、无 `update_persona / affect.update` |
+| §9 落地选型 | **部分** | SQLite 元数据 ✅、单文件零依赖 ✅、CLI+JSON 工具接口 ✅ | 原文没有落到文件系统（在 `blobs` 里）、没用 FTS5/sqlite-vec、无后台调度（没有日终 consolidation）；MCP 只有设计稿（`references/mcp.md`），**未实现**；无 `update_persona / affect.update` |
 | §9 MVP P1 | **已实现** | 建表 + 写入 + 覆盖 + 时间窗检索 + context 组装 | — |
 | §9 MVP P2 | **部分** | 热度衰减 + 压缩 + 归档 | 无区域迁移、无日终 consolidation 调度 |
 | §9 MVP P3 / P4 | **未实现** | — | 情感层、漂移检测、评估埋点、可视化 |

@@ -362,7 +362,8 @@ memory-timeline/
 │   └── memtree.cmd       # Windows 入口
 ├── references/
 │   ├── theory.md         # 数学推导（复平面模型、打分分解、时间旅行）
-│   ├── schema.md         # 表结构、状态机、压缩梯度（§5.5）、两段式删除（§5.6）、gone_at（§5.7）、recall --at（§5.8）、未来条目（§5.9）、人格卡与 persona_log（§5.11）、subject 命名、换真嵌入
+│   ├── schema.md         # 表结构、状态机、压缩梯度（§5.5）、两段式删除（§5.6）、gone_at（§5.7）、recall --at（§5.8）、未来条目（§5.9）、人格卡与 persona_log（§5.11）、分层检索 v2（§5.12）、subject 命名、换真嵌入
+│   ├── mcp.md            # MCP 封装方案（设计稿，未实现）
 │   └── prompts.md        # 注入模板与抽取提示词
 └── scripts/
     ├── memtree.py        # 全部实现，单文件，零依赖

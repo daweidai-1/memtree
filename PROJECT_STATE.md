@@ -28,6 +28,7 @@
 | `references/schema.md` | 表结构、状态机、权重公式、**§5.5 压缩梯度**、subject 命名、换真嵌入的方法 |
 | `references/theory.md` | 数学推导（复平面模型、打分分解、时间旅行），按需读，不进 SKILL |
 | `references/prompts.md` | 注入模板与抽取提示词 |
+| `references/mcp.md` | MCP 封装**设计稿**（四工具契约、两阶段删除确认、未实现） |
 | `scripts/memtree.py` | **全部实现**，单文件 153d1fc 上 2,472 行，argparse 子命令 + SQLite，零第三方依赖 |
 | `scripts/selftest.sh` | 337 项自检（33 组），末尾打印 `通过 N / 失败 M`，`FAIL>0` 则 exit 1 |
 | `bin/memtree` / `bin/memtree.cmd` | POSIX / Windows 启动器，按 `MEMTREE_PY → python3 → python → py` 找解释器 |
@@ -74,7 +75,7 @@ DB 默认 `./.workbuddy/memory/memtree.db`，用 `MEMTREE_DB` 覆盖（按项目
 | `competing` 状态 | schema §5 | 保留值，**无写入路径**：`recall --status competing` 恒为空，相关分支是死代码 | 缺「两条现状互相矛盾、等用户裁决」的交互流程 |
 | 分支语义 | §2 / schema §9 | `scope=global` 的 fact/pref 跨分支互相覆盖（分支 DAG 在状态层被抹平）；`merge` 后分支仍可 `checkout` 写入 | 需要给「全局 vs 分支」定优先级规则 |
 | 后台调度 / 日终 consolidation | §9 | 全靠手工或外部触发 | 零依赖 CLI 的边界；要做得另起进程或交给宿主 |
-| MCP 封装 / 库级 API | §9 | 只有 CLI + `--json` | 优先级低于正确性 |
+| MCP 封装 / 库级 API | §9 | 只有 CLI + `--json`；方案见 `references/mcp.md`，**未实现** | 需先补 `purge --ids`、`commit --json`；优先级低于正确性 |
 | 摘要用本地模型 | §12 待定参数 | 摘要正文是规则拼接（前 4 条片段、每条截 12 字） | 与零依赖冲突 |
 
 ### 4.1 文档类缺口（不影响功能，但会误导人）
