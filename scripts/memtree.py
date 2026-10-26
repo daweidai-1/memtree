@@ -93,7 +93,9 @@ def heat_of(row, t_now=None):
     返回值只用于触发压缩（compress --heat），永远不进入排序。
     """
     t_now = t_now or datetime.now().timestamp()
-    last = max(float(row["accessed_at"] or 0.0), float(row["t"] or 0.0))
+    # 未来时间戳按「尚未发生」算：衰减起点是现在，不是那个未来时刻。
+    # 用 max(accessed_at, t) 会让一条 2030 年的记录永久热度 1.0、永久免疫压缩。
+    last = max(float(row["accessed_at"] or 0.0), min(float(row["t"] or 0.0), t_now))
     return 0.5 ** (max(0.0, t_now - last) / 86400.0 / TAU_DAYS)
 
 
@@ -250,6 +252,7 @@ def _schema(conn):
             supersedes    INTEGER,
             superseded_by INTEGER,
             rolled_into   INTEGER,
+            gone_at       REAL,                      -- 不再作为现状的时刻（覆盖/归档发生的那一刻）
             status        TEXT NOT NULL DEFAULT 'active',
             branch        TEXT NOT NULL DEFAULT 'main',
             parent_id     INTEGER,
@@ -335,11 +338,26 @@ def _migrate(conn):
                       ("importance", "REAL NOT NULL DEFAULT 0.5"),
                       ("tombstoned_at", "REAL"),
                       ("purge_reason", "TEXT"),
+                      ("gone_at", "REAL"),
                       ("source_type", "TEXT NOT NULL DEFAULT 'stated'")):
         if name not in cols:
             conn.execute(f"ALTER TABLE nodes ADD COLUMN {name} {ddl}")
             added.add(name)
     conn.commit()
+    if "gone_at" in added:
+        # 老库只记了「现在是什么 status」，没记「什么时候不再是现状」。回溯必须靠后者，
+        # 所以补列时按最小可信代理回填：覆盖者自身的 t（我们没记写入墙钟，只有时间轴）。
+        # 回填不到（superseded_by / rolled_into 为空）就留 NULL —— 那种情况在 recall --at
+        # 里按当前 status 处理并计入 unknown_timing，绝不假装知道。
+        conn.execute("""UPDATE nodes SET gone_at=
+                          (SELECT w.t FROM nodes w WHERE w.id=nodes.superseded_by)
+                        WHERE status='superseded' AND gone_at IS NULL
+                          AND superseded_by IS NOT NULL""")
+        conn.execute("""UPDATE nodes SET gone_at=
+                          (SELECT s.t FROM nodes s WHERE s.id=nodes.rolled_into)
+                        WHERE status='archived' AND gone_at IS NULL
+                          AND rolled_into IS NOT NULL""")
+        conn.commit()
     if "zone" in added:
         # 老库补列后全是 hot，等于「单向降级」从第一天就不成立（所有记忆都在热区），
         # 所以补列后立刻按时间回填一次 —— 这是唯一一次允许的批量重算，之后只由 zone --migrate 走。
@@ -474,8 +492,10 @@ def cmd_commit(conn, a):
             loser = max(losers, key=lambda r: r["t"])
             loser_text = content_of(conn, loser["addr"])          # 先读，后转冷
             for r in losers:
-                conn.execute("UPDATE nodes SET status='superseded', superseded_by=? WHERE id=?",
-                             (win["id"], r["id"]))
+                # gone_at = 覆盖者自身的 t：回溯要回答「T 那一刻这条还是不是现状」，
+                # 只有记下覆盖发生的时刻才算得出来（当前 status 只知道结果，不知道时刻）。
+                conn.execute("""UPDATE nodes SET status='superseded', superseded_by=?, gone_at=?
+                                WHERE id=?""", (win["id"], win["t"], r["id"]))
                 conn.execute("UPDATE blobs SET hot=0 WHERE addr=?", (r["addr"],))
             decision = "supersede" if win["id"] == nid else "kept"
             rival = {"id": loser["id"], "w_lost": round(weight(loser), 3),
@@ -492,7 +512,8 @@ def cmd_commit(conn, a):
         for r in conn.execute(
             """SELECT * FROM nodes WHERE subject=? AND type=? AND status='active' AND id!=?
                ORDER BY t DESC, id DESC""", (subject, ANCHOR, nid)):
-            conn.execute("UPDATE nodes SET status='superseded', superseded_by=? WHERE id=?", (nid, r["id"]))
+            conn.execute("""UPDATE nodes SET status='superseded', superseded_by=?, gone_at=?
+                            WHERE id=?""", (nid, t_epoch, r["id"]))
             conn.execute("UPDATE blobs SET hot=0 WHERE addr=?", (r["addr"],))
         decision = "anchor-replace"
     elif ntype in STATEFUL and subject:
@@ -693,7 +714,9 @@ def cmd_merge(conn, a):
     conn.execute("UPDATE branches SET head_id=? WHERE name=?", (nid, target["name"]))
     conn.execute("UPDATE branches SET status='merged', merged_into=?, merged_at=? WHERE name=?",
                  (target["name"], now_iso(), a.name))
-    conn.execute("UPDATE nodes SET status='archived' WHERE branch=? AND status IN ('active','competing')", (a.name,))
+    # 归档＝离开现状：gone_at 记归档发生的时刻（回滚/回溯时要知道"当时它还活着"）
+    conn.execute("""UPDATE nodes SET status='archived', gone_at=?
+                    WHERE branch=? AND status IN ('active','competing')""", (t_e, a.name))
     for r in conn.execute("SELECT addr FROM nodes WHERE branch=? AND status='archived'", (a.name,)):
         conn.execute("UPDATE blobs SET hot=0 WHERE addr=?", (r["addr"],))
     conn.commit()
@@ -714,17 +737,29 @@ def cmd_context(conn, a):
     now_e = datetime.now().timestamp()
     ref = datetime.now().astimezone()
     anchors, facts, branches, events = [], [], [], []
+    n_future = 0        # 还没发生的条目数（t > now）：不参与现状判定，但要明说
 
     # 硬锚点（SPEC §6.3）：身份/关系里程碑/安全约束。独立成段、永不裁剪，
     # 也不与现状混排 —— 「最近的状态」定义我现在是谁，「锚点」定义我始终是谁。
     for r in _rows(conn, """SELECT * FROM nodes WHERE status='active' AND type=?
                             AND (scope='global' OR branch=?)""", (ANCHOR, branch)):
+        if float(r["t"] or 0.0) > now_e:      # 未来的锚点也还没发生，不进 ⚓
+            n_future += 1
+            continue
         anchors.append(f"⚓ {r['subject'] or '锚点'}: "
                        f"{clip(content_of(conn, r['addr'], True), a.width)}")
 
     stateful = [r for r in _rows(conn, """SELECT * FROM nodes WHERE status IN ('active','competing')
                                           AND type IN ('fact','pref','decision')
                                           AND (scope='global' OR branch=?)""", (branch,))]
+    # 未来条目（t > now）不是现状：它们还没发生，既不许占 ■现状 的位，
+    # 也不许把真实现状挤成「已废弃，禁止当作现状」（审计实证：一条 2027 的计划
+    # 直接顶掉了当下的真实状态）。单独给一段 ⏳，同样遵守"隐藏必须说出来"。
+    _fut = [r for r in stateful if float(r["t"] or 0.0) > now_e]
+    if _fut:
+        n_future += len(_fut)
+        _fut_ids = {r["id"] for r in _fut}
+        stateful = [r for r in stateful if r["id"] not in _fut_ids]
     # 默认只加载热区与温区（SPEC §8：默认少量预取，冷/归档按需）。
     # 保护位与锚点是例外 —— 重要但低频的记忆永远在。隐藏了必须说出来，否则就是静默丢状态。
     _hid_ids = {r["id"] for r in stateful
@@ -740,6 +775,28 @@ def cmd_context(conn, a):
     _zone_hidden = len(_hid_ids) - len({r["id"] for r in stateful
                                         if (r["zone"] or "hot") == "tombstone"} & _hid_ids)
     stateful = [r for r in stateful if r["id"] not in _hid_ids]
+    # 未来赢家不许压掉当下的现状（审计实证：一条 2030 的计划把 2025 的真实状态顶成
+    # 「已废弃，禁止当作现状」）。计划还没发生，那它覆盖掉的那条 —— 只要「离开现状的
+    # 时刻」(gone_at) 还在未来 —— 此刻依然是现状，按 gone_at 补回来。
+    _back_ids = set()
+    _best_back = {}
+    for r in conn.execute(
+            """SELECT * FROM nodes WHERE status IN ('superseded','archived')
+                 AND gone_at IS NOT NULL AND gone_at > ?
+                 AND type IN ('fact','pref','decision')
+                 AND (scope='global' OR branch=?)""", (now_e, branch)).fetchall():
+        if r["id"] in _hid_ids:
+            continue
+        k = r["subject"] or f"#{r['id']}"
+        if k not in _best_back or (r["t"], r["id"]) > (_best_back[k]["t"], _best_back[k]["id"]):
+            _best_back[k] = r
+    if _best_back:
+        _have = {r["subject"] or f"#{r['id']}" for r in stateful}
+        for k, r in _best_back.items():
+            if k in _have:          # 这个 subject 已经有真实现状，不必回溯
+                continue
+            stateful.append(r)
+            _back_ids.add(r["id"])
     wmap = _w(conn, stateful, now_e)
     anchored_sub = {x["subject"] for x in conn.execute(
         "SELECT subject FROM nodes WHERE type=? AND status='active'", (ANCHOR,))
@@ -755,7 +812,14 @@ def cmd_context(conn, a):
             line += f"  ⟦{r['event']}⟧"
         if (r["zone"] or "hot") == "cold":   # 冷区（保护区）：还在，但不再占热区
             line += "  ❄冷"
+        if r["id"] in _back_ids:             # 覆盖它的那条还在未来：它此刻仍是现状
+            line += "  (覆盖者在未来·此刻仍是现状)"
         return line
+
+    def _content(r):
+        # 被未来计划顶下去的现状，正文已经被标冷（hot=0）—— 但它正是"此刻是什么"要
+        # 回答的那句话，不许退化成「[地址 … 已转冷]」占位。
+        return content_of(conn, r["addr"], r["id"] not in _back_ids)
 
     # 冲突聚合：同 subject 下 >1 条待定
     by_sub = {}
@@ -770,7 +834,7 @@ def cmd_context(conn, a):
         if len(rs) == 1 or rs[0]["status"] != "competing":
             r = rs[0]
             if len(rs) == 1:
-                line = f"■ {sub}: {clip(content_of(conn, r['addr'], True), a.width)}"
+                line = f"■ {sub}: {clip(_content(r), a.width)}"
                 if r["factor"]:
                     line += f"  ({r['factor']})"
                 facts.append(mark(line, r))
@@ -780,7 +844,7 @@ def cmd_context(conn, a):
             facts.append(f"◆ {sub}: {parts} 冲突待定")
         else:
             r = rs[0]
-            line = f"■ {sub}: {clip(content_of(conn, r['addr'], True), a.width)}"
+            line = f"■ {sub}: {clip(_content(r), a.width)}"
             if r["factor"]:
                 line += f"  ({r['factor']})"
             facts.append(line)
@@ -859,6 +923,9 @@ def cmd_context(conn, a):
     if _zone_hidden:
         out += (f"\n❄ 冷区/归档 {_zone_hidden} 条未加载（保护位与锚点除外）"
                 " —— 显式查：recall --zone cold 或 recall --zone archive")
+    if n_future:
+        out += (f"\n⏳ 未来 {n_future} 条尚未发生（不参与现状判定）"
+                " —— 显式查：recall --at <该日期之后> 或 log --all")
     dropped = (n_fact_all - len(facts)) + (n_ev_all - len(events))
     if dropped:
         out += (f"\n⚠ 还有 {dropped} 条未展开"
@@ -867,7 +934,7 @@ def cmd_context(conn, a):
     if a.json:
         emit(conn, {"text": out, "chars": len(out), "est_tokens": est_tokens(out),
                     "shown": {"anchors": len(anchors), "facts": len(facts), "events": len(events)},
-                    "total": {"facts": n_fact_all, "events": n_ev_all},
+                    "total": {"facts": n_fact_all, "events": n_ev_all, "future": n_future},
                     "dropped": dropped})
     else:
         print(out)
@@ -897,22 +964,45 @@ def cmd_recall(conn, a):
     want = {"active", "competing"} if a.status == "auto" else \
            {"active", "competing", "superseded", "archived"} if a.status == "any" else {a.status}
 
-    # 回溯到某个时刻时，覆盖关系要按"当时"重算：
-    # 那一刻之前、同 subject 里时间最大的那条，才是当时的现状。
+    # 回溯到某个时刻：问的是「在 T 那一刻，库里的现状是什么」（SPEC §1：时间轴是主索引）。
+    # 判据必须是「覆盖/归档发生的时刻」(gone_at)，不是节点自身 t，更不是当前 status ——
+    # 只看当前 status 会让一条 8 月才被覆盖的记忆在 6 月的视角里凭空消失（审计实证的空手）。
     at_mode = a.at is not None
     cur_ids = set()
+    n_at = n_not_yet = n_gone = n_unknown = 0
     if at_mode:
         best = {}
-        for r in conn.execute("SELECT id, subject, t FROM nodes WHERE t <= ?", (t_ref,)):
-            if r["subject"] is None:
+        for r in conn.execute("SELECT * FROM nodes"):
+            if float(r["t"] or 0.0) > t_ref:              # T 那一刻还不存在
+                n_not_yet += 1
                 continue
-            if r["subject"] not in best or r["t"] > best[r["subject"]][1]:
-                best[r["subject"]] = (r["id"], r["t"])
-        cur_ids = {v[0] for v in best.values()}
+            g = r["gone_at"]
+            if g is None and r["status"] not in ("active", "competing"):
+                # 老库没记「何时离开现状」，只记了当前 status → 按当前 status 处理，
+                # 并在 as_of 统计里单列 unknown_timing：不确定的事不冒充结论。
+                n_unknown += 1
+                continue
+            if g is not None and g <= t_ref:              # T 之前就已经被覆盖/归档
+                n_gone += 1
+                continue
+            n_at += 1
+            subj = r["subject"] or f"#{r['id']}"
+            if subj not in best or (r["t"], r["id"]) > best[subj]:
+                best[subj] = (r["t"], r["id"])
+        cur_ids = {v[1] for v in best.values()}
 
     hits = []
+    _now_e = datetime.now().timestamp()
     for r in conn.execute("SELECT * FROM nodes"):
+        # 契约 G2：T 早于条目 t 时同样不返回该条 —— t 还在未来的条目，在任何 --at 视角下
+        # 都还没发生。只砍「真实未来」：--at 指向过去时，T 之后但已发生的条目仍要能检索
+        # （结果维检索靠这个），否则回溯会把已经发生的事实一起藏起来。
+        if at_mode and float(r["t"] or 0.0) > _now_e:
+            continue
         if at_mode and r["subject"]:
+            # 现状类条目按「当时」判定：T 之后才发生的现状，在 T 那一刻还不存在
+            if float(r["t"] or 0.0) > t_ref:
+                continue
             is_cur = r["id"] in cur_ids
             if a.status == "auto" and not is_cur:
                 continue
@@ -929,8 +1019,8 @@ def cmd_recall(conn, a):
         # 墓碑区默认检索不到：已受理删除的记忆不该在「我以前说过什么」里冒出来
         if not a.zone and (r["zone"] or "hot") == "tombstone":
             continue
-        # 不硬性过滤"未来"：事件的结果可能在事后才确定。
-        # "当时的状态"由上面的 cur_ids 保证（同 subject 只留 t≤t_ref 的最大者）。
+        # 不带主体的事件不参与现状判定，所以不硬性过滤"未来"：事后的结果也可能是当时的事证。
+        # 现状类（带 subject）的"当时状态"由上面的 cur_ids + gone_at 保证。
         if a.days is not None and (t_ref - r["t"]) / 86400.0 > a.days:
             continue
         st = time_weight(r["t"], t_ref)                  # t_q·t_m，t_q≡1
@@ -941,7 +1031,10 @@ def cmd_recall(conn, a):
     hits.sort(key=lambda x: -x[0])
     # 语义完全不重合（se=0）时 Σ 也是 0：那不是命中，是噪声。
     # 打 5 条 Σ=+0.000 的假命中，比说"没查到"更贵 —— 它会诱导模型编出解释。
-    hits = [h for h in hits if h[0] > 1e-9]
+    # 噪声判据看「语义是否真的重合」：回溯视角下 Σ 会被时间权重压到接近 0，
+    # 用 Σ 当门槛会把一条 4 年前、但确确实实是当时现状的记忆静默滤掉（审计实证的
+    # --at 空手就是这么来的）。所以 --at 下按语义重合判噪声，不按 Σ。
+    hits = [h for h in hits if (h[2] if at_mode else h[0]) > 1e-9]
     top = hits[: a.top]
 
     # 词面重合：随机投影词袋对"毫不相关"的两句话也会给出非零余弦，
@@ -961,14 +1054,28 @@ def cmd_recall(conn, a):
                          [(datetime.now().timestamp(), h[1]["id"]) for h in top])
         conn.commit()
     if a.json:
-        emit(conn, {"query": q_text, "t": a.at or now_iso(), "outcome": r_ref, "hits": [
+        out = {"query": q_text, "t": a.at or now_iso(), "outcome": r_ref, "hits": [
             {"id": r["id"], "score": round(s, 3), "sem": round(se, 2), "time": round(st, 2),
-             "out": round(so, 2), "status": r["status"],
+             "out": round(so, 2),
+             # --at 视角下报「当时」的 status：当时还是现状就是 active，
+             # 当前 status 另放 status_now —— 两者并列才看得出覆盖发生在什么时候。
+             "status": ("active" if at_mode and r["id"] in cur_ids else r["status"]),
+             "status_now": r["status"],
              "subject": r["subject"], "event": r["event"], "zone": r["zone"], "addr": r["addr"],
              "overlap": round(ovmap[r["id"]], 2),
              "low_confidence": ovmap[r["id"]] == 0.0,
-             "content": content_of(conn, r["addr"], True),
-             "ts": r["ts_iso"]} for s, r, se, st, so in top]})
+             # 回溯时正文必须读得到：被覆盖的条目 blob 已转冷(hot=0)，
+             # 但"当初是什么"正是要回答的问题，不是可以藏起来的冷数据。
+             "content": content_of(conn, r["addr"], not at_mode),
+             "ts": r["ts_iso"]} for s, r, se, st, so in top]}
+        if at_mode:
+            out["as_of"] = a.at
+            out["as_of_stats"] = {"active": n_at, "not_yet": n_not_yet,
+                                  "already_gone": n_gone, "unknown_timing": n_unknown}
+            out["note"] = ("as_of 口径：按「覆盖/归档发生的时刻」(gone_at) 判定当时状态；"
+                           "T 之后才发生的现状类条目不算当时现状；"
+                           "gone_at 缺失的老数据按当前 status 处理并计入 unknown_timing")
+        emit(conn, out)
         return
     if not top:
         print("(无命中) —— 记忆库里没有语义相关的条目，不要据此编造。"
@@ -1286,7 +1393,10 @@ def cmd_compress(conn, a):
             # 最近被 recall 命中过的老事件热度仍高，会被这一条挡下来。
             # label='noise' 是结算产物：只有重复提及、没到情绪/确认阈值。
             # 它豁免热度门 —— 不是放宽标准，而是加速淘汰（§3.3）。
-            and (a.heat is None or r["label"] == "noise" or heat_of(r, t_now) <= a.heat)]
+            # 未来条目按 min(t, now) 算是"刚写上去"，热度恒 1.0 —— 但"还没发生"不是
+            # 豁免压缩的理由（审计实证：一条 2030 的事件永久免疫）。它和 noise 一样走快车道。
+            and (a.heat is None or r["label"] == "noise" or float(r["t"] or 0.0) > t_now
+                 or heat_of(r, t_now) <= a.heat)]
     concl = [r for r in rows if is_conclusion(r)]
     detail = [r for r in rows if not is_conclusion(r)]
 
@@ -1297,7 +1407,15 @@ def cmd_compress(conn, a):
     done, skipped = [], []
     for key, rs in groups.items():
         keep_n = max(0, min(a.keep_detail, len(rs)))
-        to_zip = rs[: len(rs) - keep_n] if keep_n else rs      # 最新的 keep_n 条留原文
+        kept_ids = set()
+        if keep_n:
+            # "最新"指已发生的最新：未来的条目还没发生，不许抢占原文详情位
+            past = [r for r in rs if float(r["t"] or 0.0) <= t_now]
+            kept = past[len(past) - keep_n:] if len(past) > keep_n else past
+            kept_ids = {r["id"] for r in kept}
+            to_zip = [r for r in rs if r["id"] not in kept_ids]
+        else:
+            to_zip = rs
         if len(to_zip) < a.min_count:
             skipped.append({"event": key, "candidates": len(to_zip),
                             "why": f"可压 {len(to_zip)} 条 < --min-count {a.min_count}"})
@@ -1315,15 +1433,16 @@ def cmd_compress(conn, a):
             (to_zip[0]["t"], evl or to_zip[0]["subject"], addr, pack_real(text_vec(body)),
              f"压:{span}/{len(to_zip)}条", br, to_zip[0]["parent_id"],
              json.dumps({"rolled": len(to_zip), "ids": [r["id"] for r in to_zip],
-                         "event": evl, "kept_detail": [r["id"] for r in rs[len(rs) - keep_n:]]}),
+                         "event": evl, "kept_detail": sorted(kept_ids) if keep_n else []}),
              now_iso(), evl))
         sid = cur.lastrowid
         for r in to_zip:
-            conn.execute("UPDATE nodes SET status='archived', rolled_into=? WHERE id=?", (sid, r["id"]))
+            conn.execute("""UPDATE nodes SET status='archived', rolled_into=?, gone_at=?
+                            WHERE id=?""", (sid, t_now, r["id"]))
             conn.execute("UPDATE blobs SET hot=0 WHERE addr=?", (r["addr"],))
         done.append({"event": key, "summary_node": sid, "compressed": len(to_zip),
                      "span": span, "text": body,
-                     "kept_detail": [r["id"] for r in rs[len(rs) - keep_n:]]})
+                     "kept_detail": sorted(kept_ids) if keep_n else []})
     conn.commit()
     emit(conn, {"groups": done, "compressed": sum(d["compressed"] for d in done),
                 "conclusions_preserved": [r["id"] for r in concl],
