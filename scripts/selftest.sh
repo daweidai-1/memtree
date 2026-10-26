@@ -914,7 +914,7 @@ ochk "J1：空卡 persona show 打印 (卡为空)" "$TF30/empty.txt" "'(卡为�
 $M persona show --json >"$TF30/empty.json" 2>&1
 ochk "J1：空卡 --json 三槽空数组 + est_tokens 0 + 预算 800/300/350/150（契约固定值）" "$TF30/empty.json" "(lambda d: d['slots']['hard']==[] and d['slots']['soft']==[] and d['slots']['var']==[] and d['est_tokens']==0 and d['total_budget']==800 and d['slot_budgets']=={'hard':300,'soft':350,'var':150} and d['path'].endswith('.persona.md'))(json.loads(out))"
 $M context --budget 3000 >"$TF30/ctx_empty.txt"
-ochk "J1：卡为空时 context 里一个字都不许多 —— 不得出现 ⚓人格" "$TF30/ctx_empty.txt" "'⚓人格' not in out"
+ochk "J1：卡为空时不得出现 ⚓人格 内容行（图例符号不算卡内容）" "$TF30/ctx_empty.txt" "not any(l.startswith('⚓人格·') for l in out.splitlines())"
 
 # ---- J2：硬槽必须 --force ----
 $M persona set "称呼用户为老大" --slot hard >"$TF30/hard_reject.txt" 2>&1; HRC=$?
@@ -1013,6 +1013,7 @@ PF="$MEMTREE_DB.persona.md"
 $M context --budget 3000 >"$TF30/ctx_full.txt"
 ochk "J7：卡非空 → context 出现 ⚓人格·硬 行，且排在锚点行之前" "$TF30/ctx_full.txt" "(lambda ls, ip, ia: ip is not None and ia is not None and ip < ia)(out.splitlines(), next((i for i, l in enumerate(out.splitlines()) if l.startswith('⚓人格')), None), next((i for i, l in enumerate(out.splitlines()) if l.startswith('⚓') and not l.startswith('⚓人格')), None))"
 ochk "J7：⚓人格 行带上硬槽条目内容（不是空壳）" "$TF30/ctx_full.txt" "any(l.startswith('⚓人格·硬') and ('称呼用户为老大' in l) for l in out.splitlines())"
+ochk "J12：卡非空时图例行含 ⚓人格" "$TF30/ctx_full.txt" "any(l.startswith('※ ') and '⚓人格' in l for l in out.splitlines())"
 $M context --budget 60 >"$TF30/ctx_tiny.txt"
 ochk "J7：--budget 极小时人格卡行不被裁（现成裁剪只动 facts/events）" "$TF30/ctx_tiny.txt" "any(l.startswith('⚓人格·硬') and ('称呼用户为老大' in l) for l in out.splitlines())"
 $M context --budget 3000 --json >"$TF30/ctx_full.json"

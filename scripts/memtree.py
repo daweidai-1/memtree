@@ -1176,7 +1176,7 @@ def cmd_context(conn, a):
     n_all = conn.execute("SELECT COUNT(*) c FROM nodes").fetchone()["c"]
     n_cold = conn.execute("SELECT COUNT(*) c FROM nodes WHERE status!='active'").fetchone()["c"]
     head = conn.execute("SELECT head_id FROM branches WHERE name=?", (branch,)).fetchone()["head_id"]
-    legend = ("※ ⚓锚点 ■现状 ▣事件轴 ⟦事件名⟧ ❄冷 🪦墓碑 ★钉=保护位 ◇假设 ○分支(回顾点) ·事件"
+    legend = ("※ ⚓锚点 ⚓人格 ■现状 ▣事件轴 ⟦事件名⟧ ❄冷 🪦墓碑 ★钉=保护位 ◇假设 ○分支(回顾点) ·事件"
               "  (曾:…@日期)=已废弃，禁止当作现状")
     head_line = (f"【记忆 {ref.strftime('%Y-%m-%d')} | {branch}#{head or '-'} "
                  f"| {n_all}节点·废{n_cold}】")
