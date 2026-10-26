@@ -1153,6 +1153,7 @@ def cmd_label(conn, a):
         sys.exit("[memtree] label 只能是 anchor | emotional | noise | clear")
     old_pin, old_label = int(row["pinned"] or 0), row["label"]
     new_pin = 1 if lab in ("anchor", "emotional") else (0 if lab == "noise" else old_pin)
+    pin_revoked = bool(old_pin == 1 and new_pin == 0)
     conn.execute("UPDATE nodes SET label=?, pinned=? WHERE id=?", (lab, new_pin, a.node))
     conn.execute(
         """INSERT INTO settle_log(node_id,signal_types,old_pinned,new_pinned,
@@ -1160,7 +1161,10 @@ def cmd_label(conn, a):
            VALUES(?,?,?,?,?,?,?,?)""",
         (a.node, "manual", old_pin, new_pin, old_label, lab, a.reason or "手动标注", now_iso()))
     conn.commit()
-    emit(conn, {"node": a.node, "label": lab, "pinned": new_pin})
+    if pin_revoked:
+        print(f"[memtree] #{a.node} 打 noise 同时撤销了保护位（pinned 1→0）", file=sys.stderr)
+    emit(conn, {"node": a.node, "label": lab, "pinned": new_pin,
+                "pin_revoked": pin_revoked})
 
 
 def cmd_reinforce(conn, a):

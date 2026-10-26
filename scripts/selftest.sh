@@ -185,6 +185,12 @@ $M label "$IDL" anchor >/dev/null
 chk "手动 anchor 带上保护位" "c.execute('select pinned from nodes where id=$IDL').fetchone()[0]==1"
 $M label "$IDL" clear >/dev/null
 chk "clear 只清标签不动保护位" "c.execute('select label from nodes where id=$IDL').fetchone()[0] is None"
+TF18=$(mktemp -d)
+$M label "$IDL" noise >"$TF18/f6_yes.json" 2>"$TF18/f6_yes.err"
+ochk "F6：有保护位打 noise → pin_revoked=true 且 pinned=0" "$TF18/f6_yes.json" "json.loads(out)['pin_revoked'] is True and json.loads(out)['pinned']==0"
+grep -q "撤销了保护位" "$TF18/f6_yes.err" && { PASS=$((PASS+1)); echo "  ok   F6：撤销保护位时 stderr 有说明"; } || { FAIL=$((FAIL+1)); echo "  FAIL F6：撤销保护位没有提示"; }
+$M label "$IDL" noise >"$TF18/f6_no.json"
+ochk "F6：无保护位打 noise → pin_revoked=false" "$TF18/f6_no.json" "json.loads(out)['pin_revoked'] is False"
 
 echo "[19] 事件层（SPEC §2.2 最小版）"
 $M commit "转岗去做基础设施" --type fact --subject job.role --event 转岗 --ts "2026-08-01T10:00:00+08:00" -q >/dev/null
