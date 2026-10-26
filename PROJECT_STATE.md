@@ -133,6 +133,13 @@ DB 默认 `./.workbuddy/memory/memtree.db`，用 `MEMTREE_DB` 覆盖（按项目
 - **契约编号**：SPEC §8.3；自检 [33]。
 - **已知取舍**：默认仍是 `legacy`，v2 只是可选项；v2 的真实未来条目不占当前 topN、单独计入 `future_hidden`；混合相似度固定 0.85×cos + 0.15×lexical，事件单元展开数由 `--expand` 控制；v2 尚未成为默认，事件级权重/秩位衰减未做。
 
+### 5.1.6 批次记录：T6 MCP 封装方案
+
+- **提交哈希**：`08db4fc`（`docs: add MCP wrapper design`）。
+- **自检增量**：`+0`；仍为 **337 / 0（33 组）**，本批只写设计文档，不写实现。
+- **契约编号**：SPEC §9；T6 四工具 `commit/recall/context/purge`。
+- **已知取舍**：MCP 层设计为可选 stdio 适配器，核心保持零依赖；`purge` 用两阶段 preview token，候选集变化即拒绝，且禁止 `all=true`。实现前置：CLI 需先补 `purge --ids` 精确入口与 `commit --json`；在 `purge --ids` 落地前，MCP 只开放 `list/stage/restore/gc`，不暴露 `apply/now`。
+
 > 提交号会变，别只信这张表：`git log --oneline -3` 永远是对的。
 
 ### 5.2 安装态是第二份副本（必须同步）
