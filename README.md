@@ -368,6 +368,7 @@ memtree/
 ├── README.md             # 本文件
 ├── AUDIT.md              # 按 SPEC 逐节对照：哪节做了、哪节明确没做、下一期建议
 ├── PROJECT_STATE.md      # 跨会话进度台账：能力状态表、未实现清单、安装态、接手指南
+├── CHANGELOG.md          # v1.0.0 发布说明与各阶段提交区间
 ├── DESIGN.md             # 早期设计稿（思路存档；与实现冲突时以 AUDIT.md 为准）
 ├── LICENSE               # MIT
 ├── bin/
