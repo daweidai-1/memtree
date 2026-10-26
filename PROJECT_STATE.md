@@ -22,14 +22,14 @@
 |---|---|
 | `SKILL.md` | Agent 入口，每次会话加载（实测 **3,221 token**）。只留操作信息 + **图例行** |
 | `README.md` | 对外说明：解决什么问题、D1–D4 设计决定、实测账、与 mem0/Zep/Letta 对比、安装、自检输出 |
-| `AUDIT.md` | 按 SPEC 逐节对照（哪节已实现/部分/未实现）+ 改动记录 26 条 + 明确没做 + 下一期建议 |
+| `AUDIT.md` | 按 SPEC 逐节对照（哪节已实现/部分/未实现）+ 改动记录 28 条 + 明确没做 + 下一期建议 |
 | `PROJECT_STATE.md` | **本文件**：跨会话进度台账（能力状态、缺口、安装态、接手指南） |
 | `DESIGN.md` | 早期设计稿（问题定义、四个设计决定、代价），保留作思路存档；**与实现冲突时以 AUDIT.md 为准** |
 | `references/schema.md` | 表结构、状态机、权重公式、**§5.5 压缩梯度**、subject 命名、换真嵌入的方法 |
 | `references/theory.md` | 数学推导（复平面模型、打分分解、时间旅行），按需读，不进 SKILL |
 | `references/prompts.md` | 注入模板与抽取提示词 |
-| `scripts/memtree.py` | **全部实现**，单文件 9124f20 上 2,134 行，argparse 子命令 + SQLite，零第三方依赖 |
-| `scripts/selftest.sh` | 304 项自检（31 组），末尾打印 `通过 N / 失败 M`，`FAIL>0` 则 exit 1 |
+| `scripts/memtree.py` | **全部实现**，单文件 153d1fc 上 2,472 行，argparse 子命令 + SQLite，零第三方依赖 |
+| `scripts/selftest.sh` | 337 项自检（33 组），末尾打印 `通过 N / 失败 M`，`FAIL>0` 则 exit 1 |
 | `bin/memtree` / `bin/memtree.cmd` | POSIX / Windows 启动器，按 `MEMTREE_PY → python3 → python → py` 找解释器 |
 | `.github/workflows/selftest.yml` | CI：Python 3.8/3.11/3.13 三档跑同一份自检 + CLI 冒烟 |
 | `.gitattributes` / `.gitignore` / `LICENSE` | 行尾规范化 / 忽略规则 / MIT |
@@ -54,6 +54,8 @@ DB 默认 `./.workbuddy/memory/memtree.db`，用 `MEMTREE_DB` 覆盖（按项目
 | 删除路径三条硬拦 | **已实现**（`d330b28` / `5855fea`） | `pinned_refs()`:454（**含墓碑区内的 pinned**）→ `skipped_pinned`；`live_refs()`:442（`zone<>'tombstone'`，active/superseded/archived 全算）→ `skipped_shared`；`cmd_pin()` :573 拒绝墓碑区节点。计数归属：同时命中只计 `skipped_pinned` | 自检 [25]：共享地址不抹正文、`--now` 不跳过引用计数、`pin` 墓碑被拒、`zone --set tombstone` 被拒（:1586） |
 | **事件内细节梯度压缩**（SPEC §5 ①） | **已实现**（`446fd66`） | `compress --keep-detail N`（默认 1）+ `--min-count`（默认 3）+ `is_conclusion()`:1743 + `cmd_compress()`:1754；`nodes.rolled_into`、`meta{rolled,ids,event,kept_detail}` | 自检 `[24]` 20 条断言全绿：`rolled_into` 指向 / `hot=0` 非删除 / 最新 N 条逐字保留 / 事件标签继承 / 两事件不合并 / 四类结论必留 / `conclusions_preserved` 精确性 / `--keep-detail 0` 退化 / 二次压缩幂等。文档落点：`references/schema.md` §5.5、README「压缩是梯度，不是剪切」、SKILL 的 compress 段、AUDIT #16 |
 | **分类型压缩阈值**（SPEC §4.2） | **已实现**（`9124f20`） | `cmd_compress()`:1754 + `automatic_cut()`:1766：默认普通 30 天 / 重要（`importance≥0.7` 或 `pinned`）90 天 / 情感锚点（`label=emotional` 或 `type=anchor`）永不自动压缩；显式 `--days`/`--before` 统一覆盖时间分档，但不绕过结论与保护位 | 自检 `[31]` 11 条全绿：普通 31 天进、重要 31 天不进 / 91 天进、情绪 31/1000 天不进、锚点 1000 天不进、显式覆盖、缺 `importance` 老库可跑 |
+| **结构化情感层**（SPEC §7） | **已实现**（`26069d8`） | `affect` 表 :306/:407；`cmd_affect()`:633；`signal --tags/--valence` → `settle` 聚合；`recall --emotion` 权重 α=0.5；`roleplay` 双入口拒绝；`purge` 级联删 | 自检 `[32]` 18 条：别名规范化、结构化落库、多观察、未知标签拒绝、无 --emotion 老输出不变、情绪重排、隐私级联、老库补列 |
+| **分层检索 v2**（SPEC §8.3） | **已实现（灰度）** | `recall --pipeline v2`（`cmd_recall()`:1450）；有效性门→时间窗→事件过滤→混合相似度→加权排序→事件单元展开；`pipeline` 每级报数 | 自检 `[33]` 15 条：legacy 无 pipeline、六段审计、future_hidden、in=pruned+out、事件展开、--at 锚定 T |
 | **时点回溯 `recall --at`**（`87e5179`） | **已实现** | `nodes.gone_at`（`_migrate()`:341 补列、:347-359 回填：superseded 取 `superseded_by` 的 `t`、archived 取 `rolled_into` 的 `t`，回填不到留 NULL）+ `cmd_recall()` :1015-1122：`as_of` / `as_of_stats{active,not_yet,already_gone,unknown_timing}` / `status`(当时) / `status_now`(现在) | 自检 [26] 36 条：T 之后才写的不当现状、T 之前已失效的不返回、`--at` 读全文非「已转冷」占位、深回溯按语义重合 `se` 判而非 Σ。文档落点：`references/schema.md` §5.7/§5.8、README「回溯问的是当时，不是现在」、AUDIT #20/#21 |
 | **未来条目隔离**（`87e5179`） | **已实现** | `cmd_context()`：未来条目另起 `⏳ 未来 N 条尚未发生（不参与现状判定）` 段（:973）、不进 `■`、被未来覆盖者按 `gone_at > now` 补回并标 `(覆盖者在未来·此刻仍是现状)`（:829-841）、`context --json` 的 `total.future`（:983）；`heat_of()` 用 `min(t, now)` 使未来条目不免疫压缩 | 自检 [26]：`■` 不含未来正文、补回行标记、`total.future`、未来条目被 `compress` 压成 archived（有 `rolled_into`）。文档落点：`references/schema.md` §5.9、README「回溯问的是当时，不是现在」末条 |
 | **去重不连坐 + 孤儿正文回收**（`146f5c5`） | **已实现** | `_cold_blob()`:475（只有「全库没有活节点共用该地址」才转冷）；`orphan_addrs()`:464 + `purge --gc [--dry-run]`（只删 `blobs` 行、不删 `nodes` 行）+ `stats.blobs.orphans` / `orphan_bytes` | 覆盖时不再把共用地址的活节点正文一起转冷；孤儿正文可显式释放，墓碑节点仍算引用者所以冷却期内不会被当孤儿 |
@@ -67,9 +69,7 @@ DB 默认 `./.workbuddy/memory/memtree.db`，用 `MEMTREE_DB` 覆盖（按项目
 | 缺口 | SPEC | 现状 | 为什么还没做 |
 |---|---|---|---|
 | 归档区磁盘配额 | §3 / §9 | `zone='archive'` 只是标记，同库同表，无配额、无清理、无独立存储 | 需要真做独立归档文件或外部冷存储 |
-| 情感层 `affect` 表 | §7 | 只有 `label='emotional'` + `signals.quote` 保住用户原话；**没有 `emotion_tags / intensity` 结构化落库**；检索权重里没有情绪相关性（SPEC 要求与时间并列为主权重） | 需要先定情绪分类体系与打标来源 |
 | 人格卡**版本化** | §6 | 卡本体**已实现**（`12bbccb`，契约 J）：独立文件 `<db>.persona.md`、三段固定标题、三层预算 300/350/150 + 整卡 800、硬槽必须 `--force`、挤出记 `op=evict`、`persona_log` 审计、`persona show --at T` 正向重放、`context` 插 `⚓人格·硬/软/可变` 且永不裁剪 | 卡是**原地覆写**：不进 `blobs`、没有内容地址/快照/审批流，卡文件被手改也不进日志；漂移检测没有 |
-| 分层检索流水线 | §8.3 | 现在是一次打分（时间窗 + 权重排序）；有 `--event` 剪枝，但没串成「剪枝 → 事件过滤 → 混合相似度 → 加权排序 → 逐级展开」 | 依赖事件级权重 |
 | 事件边界自动化 | §2.2 | `event` 全靠外部 Agent 给；没有会话分段、独立事件节点、事件级权重、同类型事件秩位衰减 | 需要对话分段模型（与「零依赖、零 LLM」冲突） |
 | `competing` 状态 | schema §5 | 保留值，**无写入路径**：`recall --status competing` 恒为空，相关分支是死代码 | 缺「两条现状互相矛盾、等用户裁决」的交互流程 |
 | 分支语义 | §2 / schema §9 | `scope=global` 的 fact/pref 跨分支互相覆盖（分支 DAG 在状态层被抹平）；`merge` 后分支仍可 `checkout` 写入 | 需要给「全局 vs 分支」定优先级规则 |
@@ -80,8 +80,8 @@ DB 默认 `./.workbuddy/memory/memtree.db`，用 `MEMTREE_DB` 覆盖（按项目
 ### 4.1 文档类缺口（不影响功能，但会误导人）
 
 - **token 数没有可信来源**：`context` 358 token / 轮、22 条库那组数据都是「事件层 + 分区层」之前的测量；`SKILL.md` 的 token 数（曾写 3,221）会随文档改动漂移，**引用前请重测**，别把旧数字当真。
-- **CI step 名**：`.github/workflows/selftest.yml` 已改成 `Run 304 self-tests`。新增自检组时记得同时改它，否则 CI 日志的名字会撒谎。
-- **README 自检徽章/项数**已按本轮实测校正为 `304/304`、`304 项（31 组）`，组表格补到 `[31]`。
+- **CI step 名**：`.github/workflows/selftest.yml` 已改成 `Run 337 self-tests`。新增自检组时记得同时改它，否则 CI 日志的名字会撒谎。
+- **README 自检徽章/项数**已按本轮实测校正为 `337/337`、`337 项（33 组）`，组表格补到 `[33]`。
 
 ---
 
@@ -91,11 +91,11 @@ DB 默认 `./.workbuddy/memory/memtree.db`，用 `MEMTREE_DB` 覆盖（按项目
 
 | 项 | 值 |
 |---|---|
-| 代码基线 | **`9124f20`** `feat: add typed compression thresholds` |
-| 本轮关键提交 | `9124f20` 分类型压缩阈值（SPEC §4.2） · `09869c9` context 图例补 `⚓人格`（契约 J12） · `6ddb0d1` J11 回归断言 · `0040ea3` 人格硬槽 drop 防漂移 · `12bbccb` 人格卡 + 三层锚点预算（契约 J） · `46ca43b`/`0d55aac` 契约 I `--at` 事件行不打现状标记 · `548c721`/`f28f9f4` 契约 H `gone_at` 判当时有效性 · `146f5c5` 去重不连坐 + `purge --gc` · `87e5179` `gone_at`/`recall --at` + 未来条目隔离 · `d330b28` 删除路径三条硬拦 |
+| 代码基线 | **`153d1fc`** `feat: add staged retrieval pipeline v2` |
+| 本轮关键提交 | `153d1fc` 分层检索 v2（SPEC §8.3） · `26069d8` 结构化情感层（SPEC §7） · `9124f20` 分类型压缩阈值（SPEC §4.2） · `09869c9` context 图例补 `⚓人格`（契约 J12） · `6ddb0d1` J11 回归断言 · `0040ea3` 人格硬槽 drop 防漂移 · `12bbccb` 人格卡 + 三层锚点预算（契约 J） · `d330b28` 删除路径三条硬拦 |
 | 更早的骨架提交 | `1349794` 文档排序 · `c3c9414` 墓碑区 + 两段式删除 · `bf58645` 五档分区 · `812c828` 事件层最小版 · `13c4f40` 采样→结算→标签 |
-| 自检项数 | **304 项 / 31 组** |
-| 自检结果 | **通过 304 / 失败 0**（`9124f20` 工作区实测，31 组） |
+| 自检项数 | **337 项 / 33 组** |
+| 自检结果 | **通过 337 / 失败 0**（`153d1fc` 工作区实测，33 组） |
 
 ### 5.1.1 批次记录：T1 文档收尾
 
@@ -117,6 +117,20 @@ DB 默认 `./.workbuddy/memory/memtree.db`，用 `MEMTREE_DB` 覆盖（按项目
 - **自检增量**：`+11`；从 293/30 到 **304/31，通过 304 / 失败 0**。
 - **契约编号**：SPEC §4.2；自检 [31]。
 - **已知取舍**：显式 `--days` / `--before` 只覆盖时间分档，不绕过 `is_conclusion()` 与保护位；`pinned` 虽被归入“重要 90 天”，但仍受“保护位永不自动压缩”更强硬闸约束，实际不自动压；本批未改 schema，老库直接打开由 [31] 的缺 `importance` 用例覆盖。
+
+### 5.1.4 批次记录：T4 结构化情感层
+
+- **提交哈希**：`26069d8`（`feat: add structured affect layer`）。
+- **自检增量**：`+18`；从 304/31 到 **322/32，通过 322 / 失败 0**。
+- **契约编号**：SPEC §7；自检 [32]。
+- **已知取舍**：`affect` 是独立表，`nodes.label` 仍只表示“是否情感锚点”；情绪只在显式 `--emotion` 时进入排序，不带参数时旧输出逐键不变；`roleplay` 在 settle 与手写入口都拒绝；`purge --apply/--now` 级联删 `affect`。缺列老库由 `_migrate` 补 `signals.emotion_tags/valence`。
+
+### 5.1.5 批次记录：T5 分层检索 v2
+
+- **提交哈希**：`153d1fc`（`feat: add staged retrieval pipeline v2`）。
+- **自检增量**：`+15`；从 322/32 到 **337/33，通过 337 / 失败 0**。
+- **契约编号**：SPEC §8.3；自检 [33]。
+- **已知取舍**：默认仍是 `legacy`，v2 只是可选项；v2 的真实未来条目不占当前 topN、单独计入 `future_hidden`；混合相似度固定 0.85×cos + 0.15×lexical，事件单元展开数由 `--expand` 控制；v2 尚未成为默认，事件级权重/秩位衰减未做。
 
 > 提交号会变，别只信这张表：`git log --oneline -3` 永远是对的。
 
@@ -163,7 +177,7 @@ cd "C:/Users/荣贤达/OneDrive/Desktop/memory-timeline"
 MEMTREE_PY="/c/Users/荣贤达/AppData/Local/Programs/Python/Python312/python.exe" PYTHONIOENCODING=utf-8 bash scripts/selftest.sh
 ```
 
-（实测 Python 3.12.8。最后一行应打印 `通过 304 / 失败 0`，共 31 组；命令前还需要 `PYTHONIOENCODING=utf-8`。）
+（实测 Python 3.12.8。最后一行应打印 `通过 337 / 失败 0`，共 33 组；命令前还需要 `PYTHONIOENCODING=utf-8`。）
 
 ---
 

@@ -5,7 +5,7 @@
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Deps](https://img.shields.io/badge/dependencies-0-brightgreen)]()
-[![Self-test](https://img.shields.io/badge/self--test-304%2F304-success)]()
+[![Self-test](https://img.shields.io/badge/self--test-337%2F337-success)]()
 
 > A timeline-first memory layer for AI agents. Old state is superseded by time, not by an LLM vote. 530 bytes per memory, ~360 tokens per turn, zero dependencies.
 
@@ -250,17 +250,31 @@ $M graph --style git              # 输出 Mermaid 图
 - 卡是"现在是什么"，`persona_log`（`op ∈ add|del|evict`）是"改过什么"；`persona show --at T` 正向重放到那一刻（T 早于首次写入 → `(卡为空)`）。
 - 卡非空时 `context` 在首行之后、锚点之前多三行 `⚓人格·硬 / ⚓人格·软 / ⚓人格·可变`（只出非空槽），计入 `--budget` 但**永不被裁**；卡为空时输出与没有人格卡逐字相同，`context --json` 增 `persona` 三槽 + `est_tokens`。
 
+### 情感层：结构化，但只在显式查询时参与排序
+
+- `affect` 是**独立表**：一条记忆可以有多条情感观察，保存 `tags / intensity / valence / key_quote / source`；`nodes.label='emotional'` 只回答“是不是情感锚点”，不再承担完整情绪语义。
+- 固定词表 8 类 + `unspecified`：`joy / trust / surprise / sadness / fear / anger / disgust / anticipation`；CLI 接受常见中文别名。未知标签直接拒绝，不静默丢弃。
+- `signal <id> --type emotional_peak --tags 喜悦,信任 --intensity 0.9 --valence 0.8 --quote "…"` → `settle` 聚合成 `affect`。`roleplay` 内容永不进入情感层。
+- 检索用 `recall "…" --emotion 喜悦` 才激活情绪维：`S = sim × ((1-α)·时间 + α·情绪 + 结果项)`，默认 α=0.5；不带 `--emotion` 时输出与旧版逐键相同，情绪维完全休眠。
+- 情绪**只影响这次查询的排序**，不影响 status、分区、保护位、压缩或保留时长 —— 不违反“被问得多 ≠ 值得记住”。
+- `purge --apply/--now` 会级联删除该节点的 `affect` 行，避免正文删了、标签和原话还留在库里。
+
+### 分层检索 v2（灰度）
+
+`recall --pipeline v2` 才启用，默认 `legacy` 不变：`有效性门 → 时间窗剪枝 → 事件过滤 → 混合相似度 → 加权排序 → 事件级逐级展开`。每级都在 `pipeline` 对象里报 `in / pruned / out`，未来条目单列 `future_hidden`，`--at` 的时间窗锚定 T 而不是现在。展开阶段只给前 N 个检索单元加载正文，不为了排序把整库正文读一遍。
+
 ### 命令速查
 
 | 命令 | 作用 |
 |---|---|
 | `commit` | 写入；`--subject --event --importance --outcome --type --ts --refs --pin` |
 | `context` | 生成压缩记忆块；`--budget 650 --recent 3 --json --verbose`（正文另有 `⏳` 未来段，`--json` 的 `total.future`） |
-| `recall` | 定位；`--at T` 时点快照（按 `gone_at` 判当时现状，带 `as_of_stats`）、`--outcome --days --event --mode --status --top` |
+| `recall` | 定位；`--at T` 时点快照（按 `gone_at` 判当时现状，带 `as_of_stats`）、`--outcome --days --event --mode --status --top`；`--emotion` 显式启用情绪排序；`--pipeline v2` 启用分层检索（默认 legacy） |
 | `log` | 时间轴；`--brief` 精简、`--all` 含归档 |
 | `show` / `verify` | 详情 + 覆盖链 / 地址校验 |
 | `branch` / `checkout` / `merge` | 分叉 / 切换 / 合并归档 |
-| `signal` / `settle` | 采样入队 / 一次性结算成 label（带审计） |
+| `signal` / `settle` | 采样入队 / 一次性结算成 label + 结构化 `affect`（带审计） |
+| `affect` | 情感观察：`set <id> --tags 喜悦,信任 --intensity 0.9 --valence 0.8` / `show <id>` / `list` / `clear <id>` |
 | `label` / `pin` | 手动打标签 / 保护位开关 |
 | `persona` | 人格卡：`show [--json] [--at T]` / `set "…" --slot hard\|soft\|var [--force] [--reason]` / `drop "…" --slot … [--force]` / `log [--limit N] [--json]`（硬槽 `set`/`drop` 都要 `--force`，超预算按最旧挤出） |
 | `zone` | 分区：看分布 / `--migrate` 单向降级 / `--id <n> --set hot` 显式升级 |
@@ -292,7 +306,7 @@ DB 默认 `./.workbuddy/memory/memtree.db`，用 `MEMTREE_DB` 覆盖（按项目
 bash scripts/selftest.sh
 ```
 
-304 项（31 组），覆盖：时间覆盖 / 乱序补录 / 三维检索 / 内容寻址 / 分支 / context 预算 / 压缩 / 压缩梯度（`--keep-detail` 与结论必留）/ 物理清除 / 出图 / 参数校验 / 未来时间戳 / 保护位 / 硬锚点 / 非 ASCII 向量 / 热度计时器 / 事件层 / 五档分区 / 墓碑两段式 / 删除路径加固（保护位·共享地址·墓碑 pin）/ `recall --at` 时点快照与未来条目隔离 / 去重不连坐与孤儿回收（`purge --gc`）/ 事件条目的时点有效性（契约 H·I）/ 人格卡三槽预算·原子写·`--at` 回看·context 集成（契约 J）/ 分类型压缩阈值（普通 30 天·重要 90 天·情感锚点豁免）。
+337 项（33 组），覆盖：时间覆盖 / 乱序补录 / 三维检索 / 内容寻址 / 分支 / context 预算 / 压缩 / 压缩梯度（`--keep-detail` 与结论必留）/ 物理清除 / 出图 / 参数校验 / 未来时间戳 / 保护位 / 硬锚点 / 非 ASCII 向量 / 热度计时器 / 事件层 / 五档分区 / 墓碑两段式 / 删除路径加固（保护位·共享地址·墓碑 pin）/ `recall --at` 时点快照与未来条目隔离 / 去重不连坐与孤儿回收（`purge --gc`）/ 事件条目的时点有效性（契约 H·I）/ 人格卡三槽预算·原子写·`--at` 回看·context 集成（契约 J）/ 分类型压缩阈值（普通 30 天·重要 90 天·情感锚点豁免）/ 结构化情感层（`affect`·显式情绪检索·隐私级联）/ 分层检索 v2（剪枝·事件过滤·混合相似度·事件级展开）。
 
 ```
 [1] 时间权重覆盖（越新越大）        ok ×4
@@ -326,7 +340,9 @@ bash scripts/selftest.sh
 [29] 契约 I：事件行不打现状标记      ok ×15
 [30] 契约 J：人格卡三槽/--at/context  ok ×47
 [31] 分类型压缩阈值（SPEC §4.2）   ok ×11
-通过 304 / 失败 0
+[32] 情感层：affect/检索/隐私级联   ok ×18
+[33] 分层检索 v2（剪枝+事件展开）   ok ×15
+通过 337 / 失败 0
 ```
 
 ---
@@ -350,7 +366,7 @@ memory-timeline/
 │   └── prompts.md        # 注入模板与抽取提示词
 └── scripts/
     ├── memtree.py        # 全部实现，单文件，零依赖
-    └── selftest.sh       # 304 项自检（31 组）
+    └── selftest.sh       # 337 项自检（33 组）
 ```
 
 ---

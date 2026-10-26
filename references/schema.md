@@ -55,8 +55,30 @@
 | `node_id` | 指向 nodes |
 | `type` | `user_confirm`（用户明说重要）/ `correction`（纠正过）/ `emotional_peak` / `repeat_mention` |
 | `intensity` | `emotional_peak` 的强度 0~1 |
+| `emotion_tags` | 情感标签 JSON 数组，受控词表；老库由 `_migrate` 补列 |
+| `valence` | 效价 [-1,1]，负=难受，正=愉快 |
 | `quote` | 用户原话，情感场景要用它保住金句 |
 | `settled` | 0 = 待结算，1 = 已结算并清空参与资格 |
+
+### affect（结构化情感观察，SPEC §7）
+
+`signals` 是原始证据队列，`nodes.label` 只保留「是不是情感锚点」；完整情绪语义落这里，一条记忆可以有多条观察。
+
+```
+affect(id INTEGER PK AUTOINCREMENT, node_id INTEGER, t REAL, tags TEXT,
+       intensity REAL, valence REAL, key_quote TEXT, source TEXT, created_at REAL)
+CREATE INDEX idx_affect_node ON affect(node_id, t DESC)
+```
+
+| 字段 | 说明 |
+|---|---|
+| `node_id` | 指向 nodes；`purge --apply/--now` 真删节点时级联删除 |
+| `t` | 观察时刻（epoch 秒），不是记忆自身的事件时间 |
+| `tags` | JSON 数组，规范顺序、去重；固定 `joy/trust/surprise/sadness/fear/anger/disgust/anticipation/unspecified` |
+| `intensity` | 0~1；情绪相关性 = 查询标签命中率 × intensity × 来源权重 |
+| `valence` | [-1,1]，情绪方向 |
+| `key_quote` | 该次情绪的原话（隐私删除时一起消失） |
+| `source` | `stated/inferred/system`；`roleplay` 永不入库。`inferred/system` 检索权重 ×0.5 |
 
 ### settle_log（结算审计）
 
@@ -334,13 +356,15 @@ $ memtree context
 ⏳ 未来 1 条尚未发生（不参与现状判定） —— 显式查：recall --at <该日期之后> 或 log --all
 ```
 
-## 5.10 自检覆盖的契约（[25] / [26] / [31]）
+## 5.10 自检覆盖的契约（[25] / [26] / [31]–[33]）
 
 | 组 | 条数 | 断言的契约 |
 |---|---|---|
 | `[25]` 删除路径加固 | 38 | 保护位挡住 `--apply`（含墓碑区内的 pinned）；共享地址不抹正文；`--addr` 遇保护位/锚点整次拒绝；墓碑区不许 `pin`；冷却未满不删；期满真删后正文为空、`hot=2`、节点行仍在；`--restore` 分区按时间重算；`--now` 跳过冷却但**不跳过**引用计数；**计数归属**：同一地址同时命中时只计 `skipped_pinned`、不重复计 `skipped_shared`；被跳过的正文仍活着 |
 | `[26]` 时点快照 / 未来隔离 | 36 | `--at` 返回「T 那一刻是现状」的条目、不返回 T 之后才写的；T 之前已被覆盖的条目不当现状；`--at` 早于全部条目 → 空命中而不是拿后写的冒充；`status`(当时)/`status_now`(现在) 分叉；`--at` 下读全文非占位；`as_of` 回显、`as_of_stats` 四个键齐全；深回溯按 `se` 判而不被 Σ 饿死（带 `low_confidence`/`overlap`）；`context` 出 `⏳` 段且 `■` 不含未来条目；被未来覆盖者按 `gone_at > now` 补回并标 `(覆盖者在未来·此刻仍是现状)`；`total.future`；未来条目不免疫压缩 |
 | `[31]` 分类型压缩阈值（§5.5） | 11 | 普通 31 天进候选；重要 31 天不进、91 天进；`label=emotional` 31/1000 天都不进；`type=anchor` 1000 天不进；默认只压两条；显式 `--days` 让重要 31 天进候选；显式参数不绕过情感/锚点硬闸；缺 `importance` 老库可直接 compress 且列被补回 |
+| `[32]` 情感层（§4 affect / §7） | 18 | 中文别名规范化；settle 落结构化 affect；多条观察不覆盖；未知标签拒绝；roleplay 不落情感层；无 `--emotion` 老输出键不变；情绪查询重排；`affect clear` 不删记忆；`purge` 级联清标签与原话；缺情感列老库可打开 |
+| `[33]` 分层检索 v2（§5.12） | 15 | legacy 无 pipeline 对象；v2 六段审计齐全；未来单列不进 topN；每级 in=pruned+out；时间窗/事件过滤报数；事件单元展开与正文加载计数；`--at` 锚定 T 且 as_of 统计不丢；`--expand 0` 拒绝 |
 
 ## 5.11 人格卡：卡在文件系统，日志在库（SPEC §6）
 
@@ -427,6 +451,32 @@ $ memtree persona show --at 2020-01-01
 - 硬槽只有「`set` / `drop` 不给 `--force` 就改不动」这一道闸，没有漂移检测/审批流。
 - `--at` 的可信度等于日志的完整性：直连 SQL 改库或删 `persona_log` 会让历史卡不可重建。
 - 自检 [30] 契约 J 钉的是：空卡不出现 `⚓人格·*` 内容行（图例固定含 `⚓人格` 符号，不算卡内容）/ 硬槽 `--force` 闸且被拒时不落卡不落日志 / 软槽最旧挤出 + `op=evict` 留痕 / 硬槽超限不挤别人 / 整卡超 800 回滚且卡文件 sha256 不变 / `--at` 早于首次写入给 `(卡为空)`、两次写入之间给中间态 / 重复写幂等、`drop` 留 `op=del` / `⚓人格` 行排在锚点之前且 `--budget` 极小时不被裁 / 卡非空时图例行含 `⚓人格`（J12）。
+
+## 5.12 分层检索 v2（SPEC §8.3，灰度）
+
+`recall --pipeline v2` 才启用；默认 `legacy` 单遍打分不变。
+
+| 阶段 | 输入 → 输出 | 说明 |
+|---|---|---|
+| 有效性门 | 全库 → 有效候选 | status / branch / zone / tombstone / `gone_at` / 未来隔离；真实未来进 `future_hidden` |
+| 时间窗 | 有效候选 → 窗内候选 | `--days` 以 `--at` 的 T（或 now）为锚；无 `--days` 时 window=all |
+| 事件过滤 | 窗内 → 事件命中 | `--event` 在相似度之前剪枝 |
+| 混合相似度 | 候选 → 单元 | 粗排用向量余弦；展开后 `0.85*cos + 0.15*lexical` |
+| 加权排序 | 单元 → 排序 | 时间与（可选）情绪为主权重，结果项叠加；权重写进 JSON |
+| 逐级展开 | 单元 → 成员 → topN | 事件为一个单元，无事件则单条为单元；只展开前 N 个单元并加载正文 |
+
+`--json` 的 `pipeline` 字段：
+
+```json
+{"validity":{"in":5,"pruned":1,"out":4,"future_hidden":1},
+ "time_window":{"days":10,"in":4,"pruned":1,"out":3,"anchor":"now"},
+ "event_filter":{"event":"E1","in":3,"pruned":1,"out":2},
+ "similarity":{"coarse":"vector_cos","hybrid":"0.85*cos+0.15*lexical","candidates":2,"kept":2},
+ "ranking":{"time":1.0,"emotion":0.0,"outcome":1.0},
+ "expand":{"units":1,"units_expanded":1,"members_scored":2,"bodies_loaded":2}}
+```
+
+每一级都满足 `in = pruned + out`，不允许静默截断。`--at` 下时间窗锚定 T，`not_yet/already_gone/unknown_timing` 仍按原有口径给全；`t > now` 的真实未来条目任何 `--at` 都不返回。
 
 ## 6. 权重
 

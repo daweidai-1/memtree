@@ -16,7 +16,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Run 304 self-tests
+      - name: Run 337 self-tests
         run: bash scripts/selftest.sh
       - name: Smoke test CLI
         run: |

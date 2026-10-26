@@ -92,6 +92,23 @@ memtree persona log [--limit 20] [--json]         # 改过什么：add / del / e
 - 卡非空时 `context` 多三行 `⚓人格·硬 / ⚓人格·软 / ⚓人格·可变`（只出非空槽、排在锚点之前、计入 `--budget` 但**永不被裁**）；卡为空时不出现这三行内容，图例符号不变。
 - **卡是"现在是什么"，日志是"改过什么"**：`persona show --at T` 靠 `persona_log` 正向重放到那一刻（T 早于首次写入 → `(卡为空)`）。卡文件没有历史，别指望从文件里翻旧人格。
 
+## 情感层（SPEC §7）：只在显式查询时排序
+
+```bash
+memtree signal <id> --type emotional_peak --tags 喜悦,信任 --intensity 0.9 --valence 0.8 --quote "原话"
+memtree settle                                    # emotional_peak → 结构化 affect 行
+memtree affect show <id> [--json]                 # 一条记忆的全部情感观察
+memtree recall "…" --emotion 喜悦 [--emotion-weight 0.5]
+```
+
+- 固定 8 类 + `unspecified`，中文别名可用；未知标签直接拒绝。`roleplay` 永不进入情感层。
+- **不带 `--emotion` 时情绪维完全休眠**，输出与旧版一致；带情绪时时间占 `1-α`、情绪占 `α`（默认 0.5）。
+- 情绪只影响本次排序，不改 status / 分区 / 保护位 / 压缩 / 保留时长。`purge` 真删时级联删 `affect`。
+
+## 分层检索 v2（灰度）
+
+`recall "…" --pipeline v2 [--expand 20]`：有效性门 → 时间窗 → 事件过滤 → 混合相似度 → 加权排序 → 事件级展开。`--json` 的 `pipeline` 报每级 `in/pruned/out` 与 `future_hidden`；`--at` 的时间窗锚定 T。**默认仍是 `legacy`**，别在未验证场景直接换默认。
+
 ## 铁律
 
 1. **只有 ■ 是现状。** `(曾:…)` 禁止当结论，`◇` 禁止当事实。
@@ -135,5 +152,5 @@ memtree label <id> anchor|emotional|noise|clear    # 手动打标
 
 DB 默认 `./.workbuddy/memory/memtree.db`，用 `MEMTREE_DB` 覆盖（按项目分库）。
 
-自检 304 项（31 组）：`bash scripts/selftest.sh`。
+自检 337 项（33 组）：`bash scripts/selftest.sh`。
 数学推导见 `references/theory.md`；表结构与状态机见 `references/schema.md`。
