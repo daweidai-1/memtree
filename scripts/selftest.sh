@@ -690,5 +690,85 @@ ochk "补回：未来那条（搬到苏州）不得进 ■现状" "$CTX16" "'搬
 ochk "补回：全文有「⏳ 未来 1 条尚未发生」" "$CTX16" "'\u23f3 未来 1 条尚未发生' in out"
 ochk "补回：context --json 的 total.future == 1" "$CTXJ16" "json.loads(out)['total']['future']==1"
 
+echo "[27] 批次五+六：去重共用地址不许误伤活条目 + purge --gc 只回收孤儿正文"
+TF27=$(mktemp -d)
+
+# ---------- G1：共用同一内容地址时，活着的胜者不许被标成「已转冷」 ----------
+export MEMTREE_DB="$(mktemp -d)/mt_selftest17.db"
+$M init >/dev/null
+D1=$($M commit "住在南京" --type pref --subject loc -q | tail -1)
+D2=$($M commit "住在南京" --type pref --subject loc -q | tail -1)
+DADDR=$("$PY" -c "import sqlite3,os;print(sqlite3.connect(os.environ['MEMTREE_DB']).execute('select addr from nodes where id=' + str($D2)).fetchone()[0])")
+chk "G1 前置：两条正文一字不差 → 共用同一内容地址，后者覆盖前者" "c.execute(\"select count(distinct addr) from nodes where id in ($D1,$D2)\").fetchone()[0]==1 and c.execute(\"select status from nodes where id=$D2\").fetchone()[0]=='active' and c.execute(\"select status from nodes where id=$D1\").fetchone()[0]=='superseded'"
+chk "G1：该地址在库里仍是热正文（hot=1 且正文非空）—— 转冷按「还有没有活节点」判，不看地址" "c.execute(\"select hot from blobs where addr='$DADDR'\").fetchone()[0]==1 and c.execute(\"select length(content) from blobs where addr='$DADDR'\").fetchone()[0]>0"
+SHOW2="$TF27/show2.txt"; $M show $D2 >"$SHOW2"
+ochk "G1：show 胜者 #$D2 显示「在热库」+ 正文原文，不许出现「已转冷」" "$SHOW2" "'在热库' in out and '住在南京' in out and '已转冷' not in out"
+VER2="$TF27/ver2.json"; $M verify "$DADDR" --show >"$VER2"
+ochk "G1：verify --show 返回 hot==1、content 是原文、sha256 未损" "$VER2" "json.loads(out)['hot']==1 and json.loads(out)['content']=='住在南京' and json.loads(out)['sha256_ok']"
+
+# 反向回归：别把转冷整个删了 —— 不共用地址的普通覆盖，败者仍要转冷
+N1=$($M commit "旧状态：在杭州" --type pref --subject city2 -q | tail -1)
+N2=$($M commit "新状态：在苏州" --type pref --subject city2 -q | tail -1)
+chk "G1 反向回归：不共用地址的普通覆盖，败者照样转冷（hot=0）、胜者仍热（省空间机制还在）" "c.execute(\"select b.hot from nodes n join blobs b on b.addr=n.addr where n.id=$N1\").fetchone()[0]==0 and c.execute(\"select b.hot from nodes n join blobs b on b.addr=n.addr where n.id=$N2\").fetchone()[0]==1"
+SHOWN1="$TF27/shown1.txt"; $M show $N1 >"$SHOWN1"
+ochk "G1 反向回归：败者 #$N1 的 show 标记「正文: 已转冷」（回溯读 content 仍在，但热区确实没了）" "$SHOWN1" "'正文: 已转冷' in out and '正文: 在热库' not in out"
+
+# 语义边界：zone=cold 但 status=active 的节点仍算现状 —— _cold_blob 按 status 判，不按 zone 判
+H1=$($M commit "冷区边界：周会改到周四" --type event --subject cb --event 周会 --ts 2026-01-01 -q | tail -1)
+H2=$($M commit "冷区边界：周会改到周四" --type event --subject cb --event 周会 --ts 2026-01-02 -q | tail -1)
+"$PY" - "$MEMTREE_DB" <<'EOF'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+c.execute("update nodes set zone='cold'")   # 分区降级到 cold，但状态仍是 active
+c.commit()
+EOF
+$M compress --before 2026-06-01 --min-count 1 --keep-detail 0 >"$TF27/cmp27.json"
+chk "G1 边界 前置：#$H1 被压缩成 archived、（同地址的）#$H2 仍 active 且都在 cold 区" "c.execute(\"select status from nodes where id=$H1\").fetchone()[0]=='archived' and c.execute(\"select status from nodes where id=$H2\").fetchone()[0]=='active' and c.execute(\"select zone from nodes where id=$H2\").fetchone()[0]=='cold' and c.execute(\"select count(distinct addr) from nodes where id in ($H1,$H2)\").fetchone()[0]==1"
+chk "G1 边界：zone=cold 但 status=active 的节点照样保护正文（压掉同地址的另一条也不许转冷）" "c.execute(\"select hot from blobs where addr=(select addr from nodes where id=$H2)\").fetchone()[0]==1"
+SHOWH="$TF27/showh.txt"; $M show $H2 >"$SHOWH"
+ochk "G1 边界：cold 区的现状节点 show 仍是「在热库」+ 正文可读" "$SHOWH" "'在热库' in out and '冷区边界：周会改到周四' in out and '已转冷' not in out"
+
+# ---------- G2：purge --gc 只回收全库无人引用的孤儿正文 ----------
+export MEMTREE_DB="$(mktemp -d)/mt_selftest18.db"
+$M init >/dev/null
+# 造三种「不是孤儿」的引用者：转冷的历史节点、墓碑区节点、compress 压出的 archived 节点
+$M commit "旧状态：在杭州" --type pref --subject a -q >/dev/null
+$M commit "新状态：在南京" --type pref --subject a -q >/dev/null
+GT=$($M commit "墓碑正文：临时密码" --type fact --subject t -q | tail -1)
+GTADDR=$("$PY" -c "import sqlite3,os;print(sqlite3.connect(os.environ['MEMTREE_DB']).execute('select addr from nodes where id=' + str($GT)).fetchone()[0])")
+$M purge --addr "$GTADDR" --reason 隐私 >/dev/null
+for i in 1 2 3 4; do $M commit "开会第 $i 次：结论 $i" --type event --subject mtg27 --event 周会27 --ts 2026-01-0$i -q >/dev/null; done
+$M compress --before 2026-06-01 --min-count 1 --keep-detail 0 >/dev/null
+"$PY" - "$MEMTREE_DB" <<'EOF'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+c.execute("insert into blobs(addr,content,nbytes,hot,created_at) values('orphan0001','没人要的孤儿正文',30,1,'2026-01-01')")
+c.commit()
+EOF
+chk "G2 前置：手工插入的孤儿地址确实没有任何节点引用" "c.execute(\"select count(*) from blobs where addr='orphan0001'\").fetchone()[0]==1 and c.execute(\"select count(*) from nodes where addr='orphan0001'\").fetchone()[0]==0"
+chk "G2 前置：库里同时存在三类合法引用者（转冷 history / 墓碑 / archived）" "c.execute(\"select count(*) from nodes where status='archived'\").fetchone()[0]>=1 and c.execute(\"select count(*) from nodes where zone='tombstone'\").fetchone()[0]==1 and c.execute(\"select count(*) from nodes n join blobs b on b.addr=n.addr where n.status='superseded' and b.hot=0\").fetchone()[0]>=1"
+NB=$("$PY" -c "import sqlite3,os;print(sqlite3.connect(os.environ['MEMTREE_DB']).execute('select count(*) from nodes').fetchone()[0])")
+$M stats >"$TF27/stats27.json"
+ochk "G2：stats 的 blobs.orphans>=1（不跑 GC 也能看见可回收量）" "$TF27/stats27.json" "json.loads(out)['blobs']['orphans']>=1"
+$M purge --gc --dry-run >"$TF27/gcdry.json"
+ochk "G2：--dry-run 只报数：gc_removed==0 且 would_remove>=1" "$TF27/gcdry.json" "json.loads(out)['gc_removed']==0 and json.loads(out)['would_remove']>=1"
+chk "G2：--dry-run 不许真删 —— 孤儿正文仍在库里" "c.execute(\"select count(*) from blobs where addr='orphan0001'\").fetchone()[0]==1"
+$M purge --gc >"$TF27/gc1.json"
+ochk "G2：purge --gc 返回 gc_removed==1" "$TF27/gc1.json" "json.loads(out)['gc_removed']==1"
+chk "G2：孤儿正文真被删掉" "c.execute(\"select count(*) from blobs where addr='orphan0001'\").fetchone()[0]==0"
+chk "G2 安全边界①：GC 只动 blobs 表 —— nodes 行数前后不变（$NB 行）" "c.execute(\"select count(*) from nodes\").fetchone()[0]==$NB"
+chk "G2 安全边界②：墓碑区节点的正文不许被 GC 删（冷却期内还要能 --restore）" "c.execute(\"select count(*) from nodes n join blobs b on b.addr=n.addr where n.zone='tombstone' and length(b.content)>0\").fetchone()[0]==1"
+chk "G2 安全边界③：compress 压出的 archived 节点（正文转冷 hot=0 但有节点引用）不许当孤儿" "c.execute(\"select count(*) from nodes n join blobs b on b.addr=n.addr where n.status='archived' and length(b.content)>0\").fetchone()[0]>=1"
+$M purge --gc >"$TF27/gc2.json"
+ochk "G2：再跑一次幂等 —— gc_removed==0" "$TF27/gc2.json" "json.loads(out)['gc_removed']==0"
+$M purge --gc --apply >"$TF27/gcign.json"
+ochk "G2：--gc 独占本次调用 —— 输出 ignored 含 apply、且 gc_removed==0" "$TF27/gcign.json" "'apply' in (json.loads(out).get('ignored') or []) and json.loads(out)['gc_removed']==0"
+export MEMTREE_DB="$(mktemp -d)/mt_selftest19.db"
+$M init >/dev/null
+$M commit "干净库：一条正常记忆" --type fact --subject ok -q >/dev/null
+$M purge --gc >"$TF27/gcnone.json"
+ochk "G2 安全边界④：无孤儿库上跑 --gc 必须 gc_removed==0（不误伤活正文）" "$TF27/gcnone.json" "json.loads(out)['gc_removed']==0"
+chk "G2 安全边界④：无孤儿库的活正文一条没少" "c.execute(\"select count(*) from blobs where hot=1\").fetchone()[0]>=1 and c.execute(\"select count(*) from nodes\").fetchone()[0]==1"
+
 echo "通过 $PASS / 失败 $FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
