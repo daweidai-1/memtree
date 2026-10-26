@@ -580,5 +580,115 @@ gechk "$HKP" 1 "计数归属：apply 重叠时优先计 skipped_pinned"
 chk "计数归属：apply 不重复计进 skipped_shared（这次是 0）" "'$HKS'=='0'"
 chk "计数归属：正文仍活着（H1 活引用 + H2 墓碑保护位）" "c.execute(\"select length(content) from blobs where addr=?\", ('$HADDR',)).fetchone()[0]>0"
 
+echo "[26] 批次三：recall --at 时点快照 / 未来条目不进现状"
+# 契约 G1：--at T 是「T 那一刻的快照」——当时的现状按 t<=T 重算，T 之后才写的条目不得混进来。
+# 契约 G2：t 在未来的条目进「未来」段、不进现状、不把真实现状压成「已废弃」；也不因 t 在未来而免疫压缩。
+ochk() {  # ochk <描述> <输出文件> <python 表达式：out=全文, json=模块, cur=■现状区正文>
+  if OUT_FILE="$2" "$PY" - "$MEMTREE_DB" "$3" <<'EOF'
+import json, os, sys
+expr = sys.argv[2]
+out = open(os.environ["OUT_FILE"], encoding="utf-8", errors="replace").read()
+def cur():
+    # ■ 行尾的 (曾:…@日期) 是已废弃的旧正文，不能算进现状判定（不剥掉会假通过）
+    return "".join(l.split("(曾:")[0] for l in out.splitlines() if l.startswith("\u25a0"))
+sys.exit(0 if eval(expr, {"out": out, "json": json, "cur": cur}) else 1)
+EOF
+  then PASS=$((PASS+1)); echo "  ok   $1"
+  else FAIL=$((FAIL+1)); echo "  FAIL $1"
+  fi
+}
+TF=$(mktemp -d)
+
+# ---------- G1：--at T 的时点快照 ----------
+export MEMTREE_DB="$(mktemp -d)/mt_selftest13.db"
+$M init >/dev/null
+A1=$($M commit "旧状态：住在杭州" --type fact --subject loc --ts 2025-01-01 -q | tail -1)
+A2=$($M commit "新状态：搬到南京" --type fact --subject loc --ts 2025-06-01 -q | tail -1)
+A3=$($M commit "新事实：换了工作" --type fact --subject job --ts 2025-06-01 -q | tail -1)
+A4=$($M commit "古老状态：实习生" --type fact --subject role --ts 2024-01-01 -q | tail -1)
+A5=$($M commit "后来状态：正式员工" --type fact --subject role --ts 2024-06-01 -q | tail -1)
+chk "G1 前置：#A1 已被 #A2 覆盖（库里 superseded，t 分别 2025-01 / 2025-06）" "c.execute(\"select status from nodes where id=$A1\").fetchone()[0]=='superseded' and c.execute(\"select ts_iso from nodes where id=$A1\").fetchone()[0]=='2025-01-01' and c.execute(\"select ts_iso from nodes where id=$A2\").fetchone()[0]=='2025-06-01'"
+# 查询按 subject 分组：多词跨主体查询会让冷门条目 se 掉到 0 被 hits>1e-9 滤掉，断言就会恒真/恒假
+QLOC="住在杭州 搬到南京"
+QROLE="实习生 正式员工"
+QALL="住在杭州 搬到南京 换了工作 实习生 正式员工"
+ATF="$TF/at.txt"; ROLEF="$TF/role.txt"; NOWF="$TF/now.txt"; ZEROF="$TF/zero.txt"; ZEROJ="$TF/zero.json"; ATJF="$TF/at.json"
+$M recall "$QLOC" --at 2025-03-01 >"$ATF"
+$M recall "$QROLE" --at 2025-03-01 >"$ROLEF"
+$M recall "$QALL" --at 2023-01-01 >"$ZEROF"
+$M recall "$QALL" --at 2023-01-01 --json >"$ZEROJ"
+$M recall "$QLOC" --at 2025-03-01 --json >"$ATJF"
+$M recall "$QLOC" >"$NOWF"
+ochk "G1：T 之前已存在、T 之后才被覆盖的条目出现在 --at 2025-03-01 里" "$ATF" "'住在杭州' in out"
+ochk "G1：该条目当时是现状（文本标记「当时现状」）" "$ATF" "'当时现状' in out"
+ochk "G1：T 之后才写入的条目（搬到南京，同 subject）不出现" "$ATF" "'搬到南京' not in out"
+ochk "G1：T 之后才写入的条目（换了工作，另一 subject）不出现" "$ATF" "'换了工作' not in out"
+ochk "G1：T 之前就被覆盖的条目（实习生）不得当现状返回" "$ROLEF" "'实习生' not in out"
+ochk "G1：T 之前已存在且未被覆盖的条目（正式员工）照常出现" "$ROLEF" "'正式员工' in out"
+ochk "G1：--at 早于全部条目 → 无命中，不拿后写的冒充当时现状" "$ZEROF" "'无命中' in out"
+ochk "G1 对照：不给 --at 时仍是当前语义（南京在、杭州不在）" "$NOWF" "'搬到南京' in out and '住在杭州' not in out"
+ochk "G1：JSON 回显时点字段 t" "$ATJF" "json.loads(out)['t']=='2025-03-01'"
+ochk "G1：JSON 的 as_of 必须等于传入值" "$ATJF" "json.loads(out).get('as_of')=='2025-03-01'"
+ochk "G1：JSON 里该条 status 应为 active（当时它就是现状）" "$ATJF" "[h for h in json.loads(out)['hits'] if h['id']==$A1][0]['status']=='active'"
+ochk "G1：JSON 里该条 content 是正文本身，不是「已转冷」占位" "$ATJF" "'住在杭州' in [h for h in json.loads(out)['hits'] if h['id']==$A1][0]['content']"
+
+# ---------- G2：t 在未来的条目不许进现状 ----------
+export MEMTREE_DB="$(mktemp -d)/mt_selftest14.db"
+$M init >/dev/null
+P1=$($M commit "现在的状态：住在南京" --type fact --subject loc --ts 2025-06-01 -q | tail -1)
+P2=$($M commit "未来计划：明年搬到苏州" --type fact --subject loc --ts 2030-06-01 -q | tail -1)
+chk "G2 前置：#P2 的 t 在未来（2030-06-01）" "c.execute(\"select ts_iso from nodes where id=$P2\").fetchone()[0]=='2030-06-01'"
+CTXF="$TF/ctx.txt"; FUTF="$TF/fut.txt"; FTNF="$TF/futnow.txt"; FEVF="$TF/futev.txt"; CPF="$TF/comp.json"
+$M context --budget 4000 >"$CTXF"
+$M recall "搬到苏州" --at 2029-01-01 >"$FUTF"
+$M recall "住在南京" --at 2029-01-01 >"$FTNF"
+ochk "G2：context 出现「未来」标记段（⏳）" "$CTXF" "'\u23f3' in out"
+ochk "G2：■现状区不含未来条目正文（搬到苏州）" "$CTXF" "'搬到苏州' not in cur()"
+ochk "G2：■现状区显示真实现状（住在南京），未被未来条目顶掉" "$CTXF" "'现在的状态：住在南京' in cur()"
+ochk "G2：真实现状没被未来条目压成「(曾:…@日期)」已废弃" "$CTXF" "'(曾:现在的状态：住在南京' not in out"
+ochk "G2：真实现状即使不进 ■ 也不许静默消失（输出里要能看到正文）" "$CTXF" "'住在南京' in out"
+ochk "G2：recall --at 2029-01-01 不把未来条目（2030 的搬到苏州）当当时现状" "$FUTF" "'搬到苏州' not in out"
+ochk "G2：recall --at 2029-01-01 仍给出当时的真实现状（住在南京）" "$FTNF" "'住在南京' in out"
+E1=$($M commit "未来事件：搬家那天" --type event --event 搬家 --ts 2030-06-01 -q | tail -1)
+E2=$($M commit "未来事件：搬家改到次日" --type event --event 搬家 --ts 2030-06-02 -q | tail -1)
+$M recall "搬家那天 搬家改到次日" --at 2029-01-01 >"$FEVF"
+ochk "G2：recall --at 2029-01-01（早于未来事件）不返回未来事件" "$FEVF" "'搬家那天' not in out and '搬家改到次日' not in out"
+$M compress --before 2031-01-01 --min-count 1 --keep-detail 0 >"$CPF"
+chk "G2：t 在未来的事件不免疫压缩（非 HEAD 那条压成 archived 且有 rolled_into）" "c.execute(\"select status from nodes where id=$E1\").fetchone()[0]=='archived' and c.execute(\"select rolled_into from nodes where id=$E1\").fetchone()[0] is not None"
+ochk "G2：compress 报 compressed ≥ 1（未来事件真被压了）" "$CPF" "json.loads(out)['compressed']>=1"
+
+# ---------- as_of 口径自证：空手必须能区分为「那时还没有」 ----------
+ochk "as_of：json 带 as_of_stats 四个键（active/not_yet/already_gone/unknown_timing）" "$ATJF" "all(k in json.loads(out)['as_of_stats'] for k in ('active','not_yet','already_gone','unknown_timing'))"
+ochk "as_of：--at 早于全部条目 → hits 为空、not_yet>0（不是「查不到」）" "$ZEROJ" "json.loads(out)['hits']==[] and json.loads(out)['as_of_stats']['not_yet']>0 and json.loads(out)['as_of']=='2023-01-01'"
+
+# ---------- 深回溯的噪声门：时间权重把 Σ 压到 1e-16 量级，不许静默空手 ----------
+export MEMTREE_DB="$(mktemp -d)/mt_selftest15.db"
+$M init >/dev/null
+O1=$($M commit "四年前的状态：在阿里上班" --type fact --subject job --ts 2016-06-01 -q | tail -1)
+O2=$($M commit "今年换了工作：去了字节" --type fact --subject job --ts 2026-03-01 -q | tail -1)
+chk "深回溯 前置：#O1 是 2016 年的老现状，已被 #O2（今年）覆盖、正文转冷" "c.execute(\"select status from nodes where id=$O1\").fetchone()[0]=='superseded' and c.execute(\"select gone_at from nodes where id=$O1\").fetchone()[0] is not None and c.execute(\"select ts_iso from nodes where id=$O1\").fetchone()[0]=='2016-06-01'"
+DEEPF="$TF/deep.txt"; DEEPJ="$TF/deep.json"
+$M recall "在阿里上班 四年前的状态" --at 2020-06-01 --mode and >"$DEEPF"
+$M recall "在阿里上班 四年前的状态" --at 2020-06-01 --mode and --json >"$DEEPJ"
+ochk "深回溯：4 年前的老现状在 --at 2020-06-01 里必须命中（Σ 被时间权重压小也不许空手）" "$DEEPF" "'在阿里上班' in out"
+ochk "深回溯：该条当时是现状（「当时现状」标记）" "$DEEPF" "'当时现状' in out"
+ochk "深回溯：命中项带 low_confidence / overlap 字段（键必须在），且按键语义重合判据 se 判定" "$DEEPJ" "('low_confidence' in [h for h in json.loads(out)['hits'] if '在阿里上班' in (h.get('content') or '')][0]) and ('overlap' in [h for h in json.loads(out)['hits'] if '在阿里上班' in (h.get('content') or '')][0]) and [h for h in json.loads(out)['hits'] if '在阿里上班' in (h.get('content') or '')][0]['sem']>0.5"
+
+# ---------- 覆盖者在未来：真实现状要补回 ■现状，并标明此刻仍是现状 ----------
+export MEMTREE_DB="$(mktemp -d)/mt_selftest16.db"
+$M init >/dev/null
+X1=$($M commit "现在的状态：住在南京" --type pref --subject loc --ts 2025-06-01 -q | tail -1)
+X2=$($M commit "未来计划：搬到苏州" --type pref --subject loc --ts 2030-06-01 -q | tail -1)
+# 1900000000 ≈ 2030-03（epoch），用来确认 gone_at 落在未来；chk 的作用域里没有 time 模块
+chk "补回 前置：#X1 被 #X2（未来）压成 superseded、gone_at 在未来 —— 库里它已不是 active" "c.execute(\"select status from nodes where id=$X1\").fetchone()[0]=='superseded' and c.execute(\"select gone_at from nodes where id=$X1\").fetchone()[0]>1900000000 and c.execute(\"select status from nodes where id=$X2\").fetchone()[0]=='active' and c.execute(\"select ts_iso from nodes where id=$X2\").fetchone()[0]=='2030-06-01'"
+CTX16="$TF/ctx16.txt"; CTXJ16="$TF/ctx16.json"
+$M context --budget 4000 >"$CTX16"
+$M context --budget 4000 --json >"$CTXJ16"
+ochk "补回：■现状区显示南京这句正文，不是「[地址 … 已转冷]」占位" "$CTX16" "'现在的状态：住在南京' in cur() and '[地址' not in cur()"
+ochk "补回：■现状那一行带「(覆盖者在未来·此刻仍是现状)」" "$CTX16" "'(覆盖者在未来·此刻仍是现状)' in cur()"
+ochk "补回：未来那条（搬到苏州）不得进 ■现状" "$CTX16" "'搬到苏州' not in cur()"
+ochk "补回：全文有「⏳ 未来 1 条尚未发生」" "$CTX16" "'\u23f3 未来 1 条尚未发生' in out"
+ochk "补回：context --json 的 total.future == 1" "$CTXJ16" "json.loads(out)['total']['future']==1"
+
 echo "通过 $PASS / 失败 $FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
