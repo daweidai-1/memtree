@@ -1,6 +1,9 @@
-# 统一用 LF：shell 脚本在 Windows 上被转成 CRLF 后，Linux 上会报 $'\r': command not found
-* text=auto eol=lf
+# 文本统一自动归一化；可执行脚本锁 LF，Windows 批处理锁 CRLF。
+# shell 脚本在 Windows 上被转成 CRLF 后，Linux 上会报 $'\r': command not found。
+* text=auto
 *.sh text eol=lf
+bin/memtree text eol=lf
+*.cmd text eol=crlf
 *.py text eol=lf
 *.md text eol=lf
 *.yml text eol=lf
