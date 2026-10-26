@@ -1607,6 +1607,11 @@ def cmd_recall(conn, a):
             units.setdefault(key, []).append(h)
         ranked_units = sorted(units.items(), key=lambda kv: -max(x[0] for x in kv[1]))
         chosen = ranked_units[:expand_n]
+        skipped_units = ranked_units[expand_n:]
+        units_skipped = len(skipped_units)
+        members_dropped = sum(len(hs) for _k, hs in skipped_units)
+        warn = (f"expand 上限丢弃 {members_dropped} 条（--expand 增大可纳入）"
+                if members_dropped > 0 else None)
         expanded = [h for _k, hs in chosen for h in hs]
         for h in expanded:
             r = h[1]
@@ -1637,7 +1642,11 @@ def cmd_recall(conn, a):
                         "emotion": round(emo_alpha if qtags else 0.0, 3),
                         "outcome": 1.0},
             "expand": {"units": len(units), "units_expanded": len(chosen),
-                       "members_scored": len(expanded), "bodies_loaded": len(pre_rd)},
+                       "units_skipped": units_skipped,
+                       "members_scored": len(expanded),
+                       "members_dropped": members_dropped,
+                       "bodies_loaded": len(pre_rd),
+                       "warning": warn},
         }
     else:
         top = hits[: a.top]
@@ -1724,6 +1733,8 @@ def cmd_recall(conn, a):
               f" 事件 {q['event_filter']['in']}→{q['event_filter']['out']}"
               f" 展开单元 {q['expand']['units_expanded']}/{q['expand']['units']}"
               f" 未来隐藏 {q['validity']['future_hidden']}", file=sys.stderr)
+        if q["expand"].get("warning"):
+            print(f"[memtree] {q['expand']['warning']}", file=sys.stderr)
     if not top:
         print("(无命中) —— 记忆库里没有语义相关的条目，不要据此编造。"
               "若确定记过，换关键词或放宽 --days / --status any 再试")

@@ -1189,6 +1189,23 @@ ochk "--at 下时间窗锚定 T，旧条目在 T 视角窗口内仍命中" "$TF3
 ochk "--at 下 not_yet/already_gone 统计仍给全" "$TF33/at.json" "all(k in json.loads(out)['as_of_stats'] for k in ('not_yet','already_gone','unknown_timing'))"
 EX0=$($M recall "项目" --pipeline v2 --expand 0 2>&1); EXRC=$?
 chk "--expand 0 当场拒绝（避免假装展开）" "'$EXRC'!='0'"
+# F1：expand 截断必须报出丢了多少单元/条目，并给出口；未截断时字段必须为 0。
+export MEMTREE_DB="$(mktemp -d)/mt_f1.db"
+$M init >/dev/null
+F1A=$($M commit "项目 甲" --type event --event E1 --ts "2026-09-10T10:00:00+08:00" -q)
+F1B=$($M commit "项目 乙" --type event --event E1 --ts "2026-09-11T10:00:00+08:00" -q)
+F1C=$($M commit "项目 丙" --type event --event E2 --ts "2026-09-12T10:00:00+08:00" -q)
+$M recall "项目" --top 10 --json >"$TF33/f1_legacy.json"
+$M recall "项目" --pipeline v2 --top 3 --expand 1 --json >"$TF33/f1_cut.json"
+ochk "F1：expand 1 报 units_skipped=1、members_dropped>0" "$TF33/f1_cut.json" "(lambda e: e['units_skipped']==1 and e['members_dropped']>0 and e['members_scored']==1)(json.loads(out)['pipeline']['expand'])"
+ochk "F1：截断 warning 非空且给出 --expand 出口" "$TF33/f1_cut.json" "bool(json.loads(out)['pipeline']['expand']['warning']) and '--expand' in json.loads(out)['pipeline']['expand']['warning']"
+$M recall "项目" --pipeline v2 --top 3 --expand 99 --json >"$TF33/f1_full.json"
+ochk "F1：expand 99 不丢条，字段为 0、warning=None" "$TF33/f1_full.json" "(lambda e: e['units_skipped']==0 and e['members_dropped']==0 and e['warning'] is None)(json.loads(out)['pipeline']['expand'])"
+F1LEG=$("$PY" -c 'import json,sys; print(sorted(h["id"] for h in json.load(open(sys.argv[1],encoding="utf-8"))["hits"]))' "$TF33/f1_legacy.json")
+F1FULL=$("$PY" -c 'import json,sys; print(sorted(h["id"] for h in json.load(open(sys.argv[1],encoding="utf-8"))["hits"]))' "$TF33/f1_full.json")
+chk "F1：expand 99 与 legacy 命中集合一致" "'$F1LEG'=='$F1FULL'"
+F1ERR=$($M recall "项目" --pipeline v2 --top 3 --expand 1 2>&1 >/dev/null)
+echo "$F1ERR" | grep -q "expand 上限丢弃" && { PASS=$((PASS+1)); echo "  ok   F1：非 JSON 截断 warning 打到 stderr"; } || { FAIL=$((FAIL+1)); echo "  FAIL F1：stderr 没报截断（$F1ERR）"; }
 
 echo "通过 $PASS / 失败 $FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
