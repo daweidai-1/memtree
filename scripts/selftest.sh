@@ -770,5 +770,72 @@ $M purge --gc >"$TF27/gcnone.json"
 ochk "G2 安全边界④：无孤儿库上跑 --gc 必须 gc_removed==0（不误伤活正文）" "$TF27/gcnone.json" "json.loads(out)['gc_removed']==0"
 chk "G2 安全边界④：无孤儿库的活正文一条没少" "c.execute(\"select count(*) from blobs where hot=1\").fetchone()[0]>=1 and c.execute(\"select count(*) from nodes\").fetchone()[0]==1"
 
+echo "[28] 契约 H：recall --at 下无 subject 条目（事件）按 gone_at 判「当时是否仍有效」"
+TF28=$(mktemp -d)
+export MEMTREE_DB="$(mktemp -d)/mt_selftest20.db"
+$M init >/dev/null
+# 事件（无 subject）：E1 在 2026-06-01 失效（归档），E2 从不失效
+E1=$($M commit "事件：年会定在三月" --type event --event 年会 --ts 2026-01-10 -q | tail -1)
+E2=$($M commit "事件：团建定在十月" --type event --event 团建 --ts 2026-02-01 -q | tail -1)
+# 现状类（带 subject）：用来断言契约 H 没把 [26] 的三态判定一起改坏
+F1=$($M commit "旧状态：住在杭州" --type fact --subject loc28 --ts 2025-01-01 -q | tail -1)
+F2=$($M commit "新状态：搬到南京" --type fact --subject loc28 --ts 2025-06-01 -q | tail -1)
+GONE_E=$("$PY" -c 'import datetime;print(datetime.datetime(2026,6,1).timestamp())')
+"$PY" - "$MEMTREE_DB" "$E1" "$GONE_E" <<'EOF'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+# 造历史状态：E1 在 2026-06-01 被归档（gone_at 记的是「离开现状/被压掉的时刻」）
+c.execute("update nodes set status='archived', zone='archive', gone_at=? where id=?",
+          (float(sys.argv[3]), int(sys.argv[2])))
+c.commit()
+EOF
+chk "H 前置：#$E1 已失效（archived + gone_at=2026-06-01），#$E2 从未失效（gone_at 为空、active）" "c.execute(\"select status from nodes where id=$E1\").fetchone()[0]=='archived' and c.execute(\"select gone_at from nodes where id=$E1\").fetchone()[0] is not None and abs(c.execute(\"select gone_at from nodes where id=$E1\").fetchone()[0]-$GONE_E)<1 and c.execute(\"select gone_at from nodes where id=$E2\").fetchone()[0] is None and c.execute(\"select status from nodes where id=$E2\").fetchone()[0]=='active'"
+
+# ---- H①：--at + 默认 status=auto，事件按 gone_at 判当时是否仍有效 ----
+$M recall "年会定在三月" --at 2026-03-01 >"$TF28/e1_before.txt"
+ochk "H①：失效前（--at 2026-03-01）事件 #$E1 照常查得到" "$TF28/e1_before.txt" "'年会定在三月' in out"
+$M recall "年会定在三月" --at 2026-03-01 --json >"$TF28/e1_before.json"
+ochk "H①：那一刻它还没失效 → events_gone==0 且 events_active>=1" "$TF28/e1_before.json" "json.loads(out)['as_of_stats']['events_gone']==0 and json.loads(out)['as_of_stats']['events_active']>=1"
+$M recall "年会" --at 2026-08-01 >"$TF28/e1_after.txt"
+ochk "H①：失效后（--at 2026-08-01）事件 #$E1 不返回" "$TF28/e1_after.txt" "'年会定在三月' not in out"
+$M recall "年会" --at 2026-08-01 --json >"$TF28/e1_after.json"
+ochk "H①：那一刻已失效 → hits 为空且 events_gone>=1" "$TF28/e1_after.json" "json.loads(out)['hits']==[] and json.loads(out)['as_of_stats']['events_gone']>=1"
+$M recall "团建定在十月" --at 2026-03-01 >"$TF28/e2_a.txt"
+ochk "H①：从未失效的 #$E2 在 --at 2026-03-01 查得到" "$TF28/e2_a.txt" "'团建定在十月' in out"
+$M recall "团建定在十月" --at 2026-08-01 >"$TF28/e2_b.txt"
+ochk "H①：从未失效的 #$E2 在 --at 2026-08-01 照样查得到（gone_at 为空不做时点判定）" "$TF28/e2_b.txt" "'团建定在十月' in out"
+
+# ---- H④：events_active / events_gone 两个 int 键，为 0 也要在 ----
+$M recall "年会定在三月" --at 2023-01-01 --json >"$TF28/zero.json"
+ochk "H④：--at 早于全部条目时 events_active/events_gone 都在且都是 int（events_gone==0 也不许缺键、不许 null）" "$TF28/zero.json" "(lambda s: ('events_active' in s) and ('events_gone' in s) and type(s['events_active']) is int and type(s['events_gone']) is int and s['events_gone']==0)(json.loads(out)['as_of_stats'])"
+
+# ---- H⑤：文本提示行逐字出现/不出现 ----
+ochk "H⑤：events_gone>0 时追加逐字一行「（另有 1 条事件在那一刻已失效）」" "$TF28/e2_b.txt" "'（另有 1 条事件在那一刻已失效）' in out"
+ochk "H⑤：events_gone==0 时不得出现这一行" "$TF28/e1_before.txt" "'条事件在那一刻已失效' not in out"
+ochk "H⑤：无命中场景同样要把「藏了几条」说出来（不是静默空手）" "$TF28/e1_after.txt" "'(无命中)' in out and '（另有 1 条事件在那一刻已失效）' in out"
+
+# ---- H②：显式 --status 保持旧行为（按当前 status 过滤，不做时点判断） ----
+$M recall "年会定在三月" --at 2026-08-01 --status archived >"$TF28/exp_arch.txt"
+ochk "H②：显式 --status archived 时旧行为不变 —— 那条 archived 事件照样返回" "$TF28/exp_arch.txt" "'年会定在三月' in out"
+$M recall "年会定在三月" --at 2026-08-01 --status any >"$TF28/exp_any.txt"
+ochk "H②：显式 --status any 时也不做时点判断" "$TF28/exp_any.txt" "'年会定在三月' in out"
+$M recall "年会定在三月" --at 2026-08-01 --status archived --json >"$TF28/exp_arch.json"
+ochk "H②：显式 --status 时 hits 里能看到该条（status_now 仍是 archived）" "$TF28/exp_arch.json" "any((h['content'] or '').find('年会定在三月')>=0 for h in json.loads(out)['hits'])"
+
+# ---- H③：不带 --at 时行为与改动前一致 ----
+$M recall "年会定在三月" >"$TF28/no_at_e1.txt"
+ochk "H③：不带 --at → archived 事件不进 auto 结果（与改动前一致）" "$TF28/no_at_e1.txt" "'年会定在三月' not in out"
+$M recall "团建定在十月" >"$TF28/no_at_e2.txt"
+ochk "H③：不带 --at → 活事件照常命中" "$TF28/no_at_e2.txt" "'团建定在十月' in out"
+$M recall "团建定在十月" --json >"$TF28/no_at.json"
+ochk "H③：不带 --at 的 JSON 不出现 as_of_stats（时点统计只在回溯视角下给）" "$TF28/no_at.json" "'as_of_stats' not in json.loads(out)"
+
+# ---- H⑥：反向断言 —— 带 subject 的现状三态判定不回退，hit 结构不加新键 ----
+$M recall "住在杭州 搬到南京" --at 2025-03-01 >"$TF28/subj_0301.txt"
+ochk "H⑥：带 subject 的 --at 现状快照仍然正确（2025-03 只有杭州，没有后来才写的南京）" "$TF28/subj_0301.txt" "'旧状态：住在杭州' in out and '搬到南京' not in out"
+$M recall "搬到南京" --at 2025-08-01 >"$TF28/subj_0801.txt"
+ochk "H⑥：覆盖发生后（--at 2025-08-01）现状换成南京" "$TF28/subj_0801.txt" "'新状态：搬到南京' in out"
+ochk "H⑥：单条 hit 不加事件新键（events_active/events_gone 只在 as_of_stats 里）" "$TF28/e1_before.json" "not ({'events_active','events_gone'} & set(json.loads(out)['hits'][0].keys()))"
+
 echo "通过 $PASS / 失败 $FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
