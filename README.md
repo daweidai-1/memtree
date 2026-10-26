@@ -165,8 +165,8 @@ addr = sha256(content)[:16]
 只有一个文件，只用标准库（Python 3.8+）：
 
 ```bash
-git clone https://github.com/<your-name>/memory-timeline.git
-cd memory-timeline
+git clone https://github.com/daweidai-1/memtree.git
+cd memtree
 
 python scripts/memtree.py init          # 建库
 python scripts/memtree.py commit "喜欢美式" --type fact --subject user.coffee --outcome 0.5
@@ -179,7 +179,7 @@ python scripts/memtree.py context       # 看注入块长什么样
 
 ```bash
 # WorkBuddy / Claude Code 类环境
-cp -r memory-timeline ~/.workbuddy/skills/
+cp -r memtree ~/.workbuddy/skills/
 ```
 
 ### 作为独立 CLI / 库使用
@@ -353,7 +353,7 @@ bash scripts/selftest.sh
 ## 文件结构
 
 ```
-memory-timeline/
+memtree/
 ├── SKILL.md              # Agent 入口（3,221 token，精简到只留操作信息）
 ├── README.md             # 本文件
 ├── AUDIT.md              # 按 SPEC 逐节对照：哪节做了、哪节明确没做、下一期建议

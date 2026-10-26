@@ -1,5 +1,5 @@
 ---
-name: memory-timeline
+name: memtree
 description: 跨会话长期记忆库（SQLite + CLI，零依赖）。时间轴做主索引：同 subject 下新记忆按时间覆盖旧状态，避免"既喜欢 A 又喜欢 B"；旧正文转冷只留内容地址，可回溯"当初为什么改"。用于记住用户事实/偏好/决定、给长对话省 token、回答"我以前说过什么"。触发词：记住、长期记忆、时间轴记忆、记忆覆盖、agent memory。
 agent_created: true
 ---
