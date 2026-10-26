@@ -1039,6 +1039,8 @@ def cmd_recall(conn, a):
     at_mode = a.at is not None
     cur_ids = set()
     n_at = n_not_yet = n_gone = n_unknown = 0
+    # 契约 H：无 subject 的条目（事件）在 --at 下按 gone_at 判当时是否仍有效
+    n_ev_active = n_ev_gone = 0
     if at_mode:
         best = {}
         for r in conn.execute("SELECT * FROM nodes"):
@@ -1077,6 +1079,19 @@ def cmd_recall(conn, a):
                 continue
             if a.status == "superseded" and is_cur:
                 continue
+        elif at_mode and a.status == "auto":
+            # 契约 H：无 subject 的条目（事件）没有「现状快照」可言，但它一样有
+            # 「什么时候失效」—— gone_at 记的是归档发生的时刻。按当前 status 过滤
+            # 会让「2024 年那条事件」在 2024 年的视角里消失，只因为它在 2026 年被压掉。
+            # 判据：gone_at 为 NULL 或晚于 T → T 那一刻仍有效；否则那一刻已失效。
+            _tomb = (r["zone"] or "hot") == "tombstone" and not a.zone
+            _g = r["gone_at"]
+            if _g is not None and float(_g) <= t_ref:
+                if not _tomb:
+                    n_ev_gone += 1      # 那一刻已失效，被藏起来 —— 必须说出来
+                continue
+            if not _tomb:
+                n_ev_active += 1
         elif r["status"] not in want:
             continue
         if a.branch and not (r["branch"] == a.branch or r["scope"] == "global"):
@@ -1155,15 +1170,26 @@ def cmd_recall(conn, a):
         if at_mode:
             out["as_of"] = a.at
             out["as_of_stats"] = {"active": n_at, "not_yet": n_not_yet,
-                                  "already_gone": n_gone, "unknown_timing": n_unknown}
+                                  "already_gone": n_gone, "unknown_timing": n_unknown,
+                                  # 无 subject 条目的时点有效性单独计数（契约 H）：
+                                  # 即使是 0 也出现，别让调用方分不清"没有"和"没算"
+                                  "events_active": int(n_ev_active),
+                                  "events_gone": int(n_ev_gone)}
             out["note"] = ("as_of 口径：按「覆盖/归档发生的时刻」(gone_at) 判定当时状态；"
                            "T 之后才发生的现状类条目不算当时现状；"
                            "gone_at 缺失的老数据按当前 status 处理并计入 unknown_timing")
         emit(conn, out)
         return
+    def _gone_hint():
+        # 隐藏必须说出来（契约 H ⑤）：那一刻已失效、因此没出现在结果里的事件条数。
+        # 为 0 时一个字都不打（也不留空行）。
+        if at_mode and n_ev_gone > 0:
+            print(f"（另有 {n_ev_gone} 条事件在那一刻已失效）")
+
     if not top:
         print("(无命中) —— 记忆库里没有语义相关的条目，不要据此编造。"
               "若确定记过，换关键词或放宽 --days / --status any 再试")
+        _gone_hint()
         return
     if top and all(v == 0.0 for v in ovmap.values()):
         print("(低置信) 没有任何词面重合 —— 下面的命中来自随机投影的噪声相似度，别当证据。")
@@ -1192,6 +1218,7 @@ def cmd_recall(conn, a):
               f"{clip(body, a.width)}{tag}"
               f"{' ⟦' + r['event'] + '⟧' if r['event'] else ''}"
               f"{' 「无词面重合·低置信」' if ovmap[r['id']] == 0.0 else ''} {flag}")
+    _gone_hint()
 
 
 def bar(s):
