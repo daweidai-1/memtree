@@ -898,5 +898,125 @@ $M recall "聚餐" --at 2026-03-01 >"$TF29/ev_lowconf.txt"
 ochk "I⑥：--at 下低置信分支里的事件行同样一个字现状标记都没有（带 ⟦事件名⟧ 的行才判，非事件行照旧有标记）" "$TF29/ev_lowconf.txt" "(lambda ls: bool(ls) and not any(('当时已过时' in l) or ('当时现状' in l) or ('不可当现状' in l) for l in ls))([l for l in out.splitlines() if '⟦' in l])"
 ochk "I⑥：这一跑确实落进了低置信分支，且带 subject 的行仍保留「当时现状」（对照，防止整库标记被删）" "$TF29/ev_lowconf.txt" "'(低置信)' in out and '「当时现状」' in out"
 
+echo "[30] 契约 J：人格卡三槽预算 / 原子写 / --at 回看 / context 集成"
+TF30=$(mktemp -d)
+export MEMTREE_DB="$(mktemp -d)/mt_selftest22.db"
+PF="$MEMTREE_DB.persona.md"
+card_has() { grep -c "$1" "$PF" 2>/dev/null | tail -1; }   # 卡文件里出现次数，文件不存在算 0
+$M init >/dev/null
+$M commit "她叫小满" --type anchor --subject id.name -q >/dev/null
+$M commit "最近在做 memory-timeline" --type fact --subject work -q >/dev/null
+
+# ---- J1：空卡 ----
+$M persona show >"$TF30/empty.txt" 2>&1; SRC=$?
+chk "J1：空卡 persona show 退出码为 0" "'$SRC'=='0'"
+ochk "J1：空卡 persona show 打印 (卡为空)" "$TF30/empty.txt" "'(卡为空)' in out"
+$M persona show --json >"$TF30/empty.json" 2>&1
+ochk "J1：空卡 --json 三槽空数组 + est_tokens 0 + 预算 800/300/350/150（契约固定值）" "$TF30/empty.json" "(lambda d: d['slots']['hard']==[] and d['slots']['soft']==[] and d['slots']['var']==[] and d['est_tokens']==0 and d['total_budget']==800 and d['slot_budgets']=={'hard':300,'soft':350,'var':150} and d['path'].endswith('.persona.md'))(json.loads(out))"
+$M context --budget 3000 >"$TF30/ctx_empty.txt"
+ochk "J1：卡为空时 context 里一个字都不许多 —— 不得出现 ⚓人格" "$TF30/ctx_empty.txt" "'⚓人格' not in out"
+
+# ---- J2：硬槽必须 --force ----
+$M persona set "称呼用户为老大" --slot hard >"$TF30/hard_reject.txt" 2>&1; HRC=$?
+chk "J2：硬槽不带 --force 必须拒绝（非 0 退出，契约要求 2）" "'$HRC'!='0'"
+ochk "J2：拒绝时说清为什么 —— 提示需要 --force 防人格漂移" "$TF30/hard_reject.txt" "('force' in out) and ('硬槽' in out)"
+HAS_HARD=$(card_has "称呼用户为老大"); HAS_HARD=${HAS_HARD:-0}
+chk "J2：拒绝时卡文件里不许出现该条" "'$HAS_HARD'=='0'"
+chk "J2：拒绝时 persona_log 里没有 hard 的 add 记录" "c.execute(\"select count(*) from persona_log where slot='hard' and op='add'\").fetchone()[0]==0"
+$M persona set "称呼用户为老大" --slot hard --force >"$TF30/hard_ok.txt" 2>&1; HRC2=$?
+chk "J2：带 --force 才能写进去，且退出码 0" "'$HRC2'=='0'"
+HAS_HARD2=$(card_has "称呼用户为老大"); HAS_HARD2=${HAS_HARD2:-0}
+chk "J2：--force 后卡文件里出现该条" "'$HAS_HARD2'!='0'"
+chk "J2：--force 后 persona_log 有 op=add 的硬槽记录" "c.execute(\"select count(*) from persona_log where slot='hard' and op='add'\").fetchone()[0]>=1"
+sleep 1.1   # 让「第一次写」与「第二次写」的 t 一定不同，--at 才回看得清楚
+
+# ---- J8：同条重复 set 幂等 ----
+$M persona set "偏爱简短回答" --slot soft >"$TF30/soft1.txt" 2>&1; SRC1=$?
+LOGN1=$($PY - "$MEMTREE_DB" <<'PYEOF'
+import sqlite3, sys
+print(sqlite3.connect(sys.argv[1]).execute("select count(*) from persona_log").fetchone()[0])
+PYEOF
+)
+$M persona set "偏爱简短回答" --slot soft >"$TF30/soft1_dup.txt" 2>&1; SRC2=$?
+LOGN2=$($PY - "$MEMTREE_DB" <<'PYEOF'
+import sqlite3, sys
+print(sqlite3.connect(sys.argv[1]).execute("select count(*) from persona_log").fetchone()[0])
+PYEOF
+)
+chk "J8：首次 set 软槽条目成功（退出码 0）" "'$SRC1'=='0'"
+ochk "J8：重复 set 同一软槽条目 → changed 为 false（或明确「已存在，未改动」）" "$TF30/soft1_dup.txt" "('changed' in out and 'false' in out) or '已存在' in out"
+chk "J8：重复 set 幂等 —— persona_log 行数一条都没多" "'$LOGN1'=='$LOGN2'"
+
+# ---- J3：软槽超预算按最旧挤出 ----
+for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+  $M persona set "软槽条目$i：这是一条用来压满软槽预算的条目内容" --slot soft >"$TF30/soft_$i.txt" 2>&1
+done
+HAS_S1=$(card_has "软槽条目1："); HAS_S1=${HAS_S1:-0}
+chk "J3：软槽塞爆后最旧的条目被挤出卡文件" "'$HAS_S1'=='0'"
+chk "J3：挤出必须留痕 —— persona_log 有 op=evict 记录" "c.execute(\"select count(*) from persona_log where op='evict'\").fetchone()[0]>=1"
+ochk "J3：最后一次 set 报告的 slot_tokens 已回到软槽预算内（≤350）" "$TF30/soft_12.txt" "(json.loads(out)['slot_tokens']<=350) if out.strip().startswith('{') else ('软槽预算超限' not in out)"
+
+# ---- J9：drop ----
+$M persona drop "软槽条目12：这是一条用来压满软槽预算的条目内容" --slot soft >"$TF30/drop_yes.txt" 2>&1; DRC=$?
+chk "J9：drop 存在的条目退出码 0" "'$DRC'=='0'"
+HAS_S12=$(card_has "软槽条目12："); HAS_S12=${HAS_S12:-0}
+chk "J9：drop 之后卡文件里该条消失" "'$HAS_S12'=='0'"
+chk "J9：drop 必须留痕 —— persona_log 有 op=del 记录" "c.execute(\"select count(*) from persona_log where op='del'\").fetchone()[0]>=1"
+$M persona drop "这条根本不在卡里" --slot soft >"$TF30/drop_no.txt" 2>&1; DRC2=$?
+chk "J9：drop 不存在的条目退出码 0（不是报错）" "'$DRC2'=='0'"
+ochk "J9：drop 不存在的条目 changed 为 false" "$TF30/drop_no.txt" "('changed' in out and 'false' in out) or '不存在' in out"
+
+# ---- J6：--at 回看人格卡 ----
+$M persona show --at 2000-01-01 >"$TF30/at_before.txt" 2>&1; ARC=$?
+chk "J6：--at 早于首次写入 → (卡为空) 且退出码 0" "'$ARC'=='0'"
+ochk "J6：--at 早于首次写入确实打印 (卡为空)" "$TF30/at_before.txt" "'(卡为空)' in out"
+TS_MID=$($PY - "$MEMTREE_DB" <<'PYEOF'
+import sqlite3, sys, datetime
+c = sqlite3.connect(sys.argv[1])
+ts = sorted({r[0] for r in c.execute("select t from persona_log").fetchall()})
+t1 = ts[0]
+t2 = ts[1] if len(ts) > 1 else t1 + 2
+print(datetime.datetime.fromtimestamp((t1 + t2) / 2.0).isoformat())
+PYEOF
+)
+$M persona show --at "$TS_MID" >"$TF30/at_mid.txt" 2>&1
+ochk "J6：--at 回看到两次写入之间的中间态（只有第一次的硬槽条目，没有后来的软槽条目）" "$TF30/at_mid.txt" "'称呼用户为老大' in out and '软槽条目' not in out"
+
+# ---- J5：整张卡超总预算 800 必须拒写，并报三槽占用 ----
+# 总预算 800 == 硬 300 + 软 350 + 可变 150，所以只有三槽都贴着上限、再把一条塞进空位的
+# 那一次才可观测。软/可变槽超预算会先按「最旧优先」挤出（整卡总量不变），顶不到 800，
+# 因此这里换一个独立库，用「大条目 + 空软槽」把三个槽钉在边上，再塞软槽。
+KEEP_DB="$MEMTREE_DB"
+export MEMTREE_DB="$(mktemp -d)/mt_selftest23.db"
+$M init >/dev/null
+HARD_BIG=$("$PY" -c 'print("硬槽预算条目" + "满"*186)')
+VAR_BIG=$("$PY" -c 'print("可变槽预算条目" + "满"*92)')
+SOFT_BIG=$("$PY" -c 'print("软槽预算条目" + "满"*224)')
+$M persona set "称呼用户为老大" --slot hard --force >"$TF30/j5_h1.txt" 2>&1
+$M persona set "$HARD_BIG" --slot hard --force >"$TF30/j5_h2.txt" 2>&1
+$M persona set "$VAR_BIG" --slot var >"$TF30/j5_v.txt" 2>&1
+$M persona show --json >"$TF30/over_before.json" 2>&1
+ochk "J5 前置：硬槽与可变槽已贴到上限、整卡仍在总预算内（软槽还空着）" "$TF30/over_before.json" "(lambda d: d['est_tokens'] < 800 and d['slots']['hard'] and d['slots']['var'] and d['slots']['soft'] == [])(json.loads(out))"
+CARD5="$MEMTREE_DB.persona.md"
+SHA5_BEF=$("$PY" -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$CARD5")
+$M persona set "$SOFT_BIG" --slot soft >"$TF30/over_total.txt" 2>&1; ORC=$?
+chk "J5：整张卡超总预算必须拒写（非 0 退出）" "'$ORC'!='0'"
+ochk "J5：拒写时把总预算 800 与三槽占用报出来" "$TF30/over_total.txt" "('800' in out) and ('硬' in out) and ('软' in out) and ('可变' in out)"
+SHA5_AFT=$("$PY" -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$CARD5")
+chk "J5：拒写不许留半张卡 —— 卡文件 sha256 前后一致" "'$SHA5_AFT'=='$SHA5_BEF'"
+$M persona show --json >"$TF30/over_after.json" 2>&1
+ochk "J5：被拒的那条没有落进卡里（整卡回滚，软槽仍为空）" "$TF30/over_after.json" "(lambda d: d['slots']['soft'] == [] and d['est_tokens'] < 800)(json.loads(out))"
+export MEMTREE_DB="$KEEP_DB"
+PF="$MEMTREE_DB.persona.md"
+
+# ---- J7：context 集成 ----
+$M context --budget 3000 >"$TF30/ctx_full.txt"
+ochk "J7：卡非空 → context 出现 ⚓人格·硬 行，且排在锚点行之前" "$TF30/ctx_full.txt" "(lambda ls, ip, ia: ip is not None and ia is not None and ip < ia)(out.splitlines(), next((i for i, l in enumerate(out.splitlines()) if l.startswith('⚓人格')), None), next((i for i, l in enumerate(out.splitlines()) if l.startswith('⚓') and not l.startswith('⚓人格')), None))"
+ochk "J7：⚓人格 行带上硬槽条目内容（不是空壳）" "$TF30/ctx_full.txt" "any(l.startswith('⚓人格·硬') and ('称呼用户为老大' in l) for l in out.splitlines())"
+$M context --budget 60 >"$TF30/ctx_tiny.txt"
+ochk "J7：--budget 极小时人格卡行不被裁（现成裁剪只动 facts/events）" "$TF30/ctx_tiny.txt" "any(l.startswith('⚓人格·硬') and ('称呼用户为老大' in l) for l in out.splitlines())"
+$M context --budget 3000 --json >"$TF30/ctx_full.json"
+ochk "J7：context --json 带 persona 三槽与 est_tokens" "$TF30/ctx_full.json" "(lambda p: ('persona' in p) and len(p['persona']['hard'])>=1 and isinstance(p['persona']['est_tokens'], int) and p['persona']['est_tokens']>0)(json.loads(out))"
+
 echo "通过 $PASS / 失败 $FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
