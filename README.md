@@ -9,6 +9,16 @@
 
 > A timeline-first memory layer for AI agents. Old state is superseded by time, not by an LLM vote. 530 bytes per memory, ~360 tokens per turn, zero dependencies.
 
+## Quick Start
+
+```bash
+git clone https://github.com/daweidai-1/memtree.git
+cd memtree
+python scripts/memtree.py init
+python scripts/memtree.py commit "喜欢美式" --type fact --subject user.coffee
+python scripts/memtree.py context
+```
+
 ---
 
 ## 它解决的问题
