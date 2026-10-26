@@ -51,8 +51,11 @@ ANCHOR = "anchor"      # 硬锚点：身份/关系里程碑/安全约束。不�
 GLYPH = {"active": "●", "superseded": "◐", "archived": "○", "competing": "◆"}
 # 分区（SPEC §3）：时间单向降级 hot→warm→cold→archive。升级只能显式（zone --set），
 # 因为「被问得多」不等于「值得记住」—— 调用次数不许把球往回推（铁律一）。
-ZONES = ("hot", "warm", "cold", "archive", "tombstone")
-ZONE_RANK = {"hot": 0, "warm": 1, "cold": 2, "archive": 3, "tombstone": 4}
+ZONES = ("hot", "warm", "cold", "archive", "tombstone", "purged")
+ZONE_RANK = {"hot": 0, "warm": 1, "cold": 2, "archive": 3, "tombstone": 4, "purged": 5}
+# 墓碑与已抹正文终态都不参与正常检索/上下文/活引用计数。purged 是终点：
+# zone='tombstone' 只表示「已受理删除、冷却中」，真删成功后必须离开墓碑区。
+HIDDEN_ZONES = ("tombstone", "purged")
 PURGE_COOLDOWN_DAYS = 7.0           # 墓碑区冷却期：删除不可逆，缓冲几天给手滑与「真要删」区分开
 HOT_DAYS, WARM_DAYS = 7.0, 90.0     # 热 ≤7 天；温 7~90 天；更旧则看重要度：冷（保护区）或归档
 COLD_MIN_IMPORTANCE = 0.7           # 进冷区（保护区）的重要度下限：冷区不是垃圾桶
@@ -515,7 +518,7 @@ def live_refs(conn, addr):
     节点共用同一 addr，抹掉就是删别人的数据，不可恢复。
     """
     return conn.execute("SELECT COUNT(*) c FROM nodes WHERE addr=?"
-                        " AND (zone IS NULL OR zone<>'tombstone')",
+                        " AND (zone IS NULL OR zone NOT IN ('tombstone','purged'))",
                         (addr,)).fetchone()["c"]
 
 
@@ -550,7 +553,7 @@ def _cold_blob(conn, addr):
     """
     alive = conn.execute(
         "SELECT COUNT(*) c FROM nodes WHERE addr=? AND status IN ('active','competing')"
-        " AND (zone IS NULL OR zone<>'tombstone')", (addr,)).fetchone()["c"]
+        " AND (zone IS NULL OR zone NOT IN ('tombstone','purged'))", (addr,)).fetchone()["c"]
     if alive:
         return 0
     return conn.execute("UPDATE blobs SET hot=0 WHERE addr=? AND hot=1", (addr,)).rowcount
@@ -634,8 +637,8 @@ def cmd_affect(conn, a):
     act = a.action
     if act == "set":
         nrow = node(conn, a.node)
-        if (nrow["zone"] or "hot") == "tombstone":
-            sys.exit("[memtree] 墓碑区节点已受理删除，不能再挂情感观察")
+        if (nrow["zone"] or "hot") in HIDDEN_ZONES:
+            sys.exit("[memtree] 已删除/冷却中的节点不能再挂情感观察")
         if a.source == "roleplay" or (nrow["source_type"] or "stated") == "roleplay":
             sys.exit("[memtree] roleplay 内容不进入情感层（防虚构污染）")
         tags = normalize_affect_tags(a.tags)
@@ -1007,6 +1010,8 @@ def cmd_commit(conn, a):
 def cmd_pin(conn, a):
     """保护位：不压缩、不硬删、不裁剪（§5.4 保护位机制）。"""
     r = node(conn, a.id)
+    if (r["zone"] or "hot") == "purged":
+        sys.exit(f"[memtree] #{a.id} 正文已永久删除，保护位无意义")
     if (r["zone"] or "hot") == "tombstone":
         sys.exit(f"[memtree] #{a.id} 在墓碑区：墓碑区节点没有保护位可用，"
                  f"请先 purge --restore {a.id}")
@@ -1236,7 +1241,9 @@ def cmd_context(conn, a):
     # 硬锚点（SPEC §6.3）：身份/关系里程碑/安全约束。独立成段、永不裁剪，
     # 也不与现状混排 —— 「最近的状态」定义我现在是谁，「锚点」定义我始终是谁。
     for r in _rows(conn, """SELECT * FROM nodes WHERE status='active' AND type=?
-                            AND (scope='global' OR branch=?)""", (ANCHOR, branch)):
+                            AND (scope='global' OR branch=?)
+                            AND COALESCE(zone,'hot') NOT IN ('tombstone','purged')""",
+                   (ANCHOR, branch)):
         if float(r["t"] or 0.0) > now_e:      # 未来的锚点也还没发生，不进 ⚓
             n_future += 1
             continue
@@ -1245,7 +1252,9 @@ def cmd_context(conn, a):
 
     stateful = [r for r in _rows(conn, """SELECT * FROM nodes WHERE status IN ('active','competing')
                                           AND type IN ('fact','pref','decision')
-                                          AND (scope='global' OR branch=?)""", (branch,))]
+                                          AND (scope='global' OR branch=?)
+                                          AND COALESCE(zone,'hot') NOT IN ('tombstone','purged')""",
+                                 (branch,))]
     # 未来条目（t > now）不是现状：它们还没发生，既不许占 ■现状 的位，
     # 也不许把真实现状挤成「已废弃，禁止当作现状」（审计实证：一条 2027 的计划
     # 直接顶掉了当下的真实状态）。单独给一段 ⏳，同样遵守"隐藏必须说出来"。
@@ -1293,8 +1302,8 @@ def cmd_context(conn, a):
             _back_ids.add(r["id"])
     wmap = _w(conn, stateful, now_e)
     anchored_sub = {x["subject"] for x in conn.execute(
-        "SELECT subject FROM nodes WHERE type=? AND status='active'", (ANCHOR,))
-        if x["subject"]}
+        "SELECT subject,zone FROM nodes WHERE type=? AND status='active'", (ANCHOR,))
+        if x["subject"] and (x["zone"] or "hot") not in HIDDEN_ZONES}
 
     def mark(line, r):
         # ★钉=保护位，永不被裁剪；⚑=该 subject 有锚点，现状与锚点并存要看得见
@@ -1344,7 +1353,8 @@ def cmd_context(conn, a):
             facts.append(line)
 
     for r in reversed(_rows(conn, """SELECT * FROM nodes WHERE status='active' AND type='hypothesis'
-                                     AND branch=? AND (zone IS NULL OR zone!='tombstone')""",
+                                     AND branch=?
+                                     AND COALESCE(zone,'hot') NOT IN ('tombstone','purged')""",
                             (branch,))):
         facts.append(f"◇ {r['subject'] or '假设'}: {clip(content_of(conn, r['addr'], True), a.width)}")
 
@@ -1355,6 +1365,7 @@ def cmd_context(conn, a):
         """SELECT event ev, MIN(t) t0, MAX(t) t1, COUNT(*) c FROM nodes
            WHERE event IS NOT NULL AND status IN ('active','competing')
              AND (scope='global' OR branch=?)
+             AND COALESCE(zone,'hot') NOT IN ('tombstone','purged')
            GROUP BY event ORDER BY t1 DESC""", (branch,)))
     for e in _evrows[:8]:
         evl.append(f"▣ {e['ev']} {short_date(e['t0'], ref)}~{short_date(e['t1'], ref)} {e['c']}条")
@@ -1369,7 +1380,7 @@ def cmd_context(conn, a):
     # 墓碑区是「已受理删除」：连事件轴都不许出现，否则删除只删了 status、没删掉记忆
     ev = [r for r in _rows(conn, """SELECT * FROM nodes WHERE status='active'
                                     AND type IN ('event','merge','summary')""")
-          if r["branch"] == branch and (r["zone"] or "hot") != "tombstone"]
+          if r["branch"] == branch and (r["zone"] or "hot") not in HIDDEN_ZONES]
     picked = ev[-a.recent:] if a.recent else []
     picked += [r for r in ev if r["type"] == "summary" and r["id"] not in {p["id"] for p in picked}][-2:]
     for r in sorted(picked, key=lambda r: (r["t"], r["id"]), reverse=True):
@@ -1544,7 +1555,7 @@ def cmd_recall(conn, a):
             # 「什么时候失效」—— gone_at 记的是归档发生的时刻。按当前 status 过滤
             # 会让「2024 年那条事件」在 2024 年的视角里消失，只因为它在 2026 年被压掉。
             # 判据：gone_at 为 NULL 或晚于 T → T 那一刻仍有效；否则那一刻已失效。
-            _tomb = (r["zone"] or "hot") == "tombstone" and not a.zone
+            _tomb = (r["zone"] or "hot") in HIDDEN_ZONES and not a.zone
             _g = r["gone_at"]
             if _g is not None and float(_g) <= t_ref:
                 if not _tomb:
@@ -1562,8 +1573,9 @@ def cmd_recall(conn, a):
         if a.zone and (r["zone"] or "hot") not in [z.strip() for z in a.zone.split(",")]:
             p_rej_valid += 1
             continue
-        # 墓碑区默认检索不到：已受理删除的记忆不该在「我以前说过什么」里冒出来
-        if not a.zone and (r["zone"] or "hot") == "tombstone":
+        # 墓碑与已抹正文终态默认检索不到：已受理/已完成删除的记忆
+        # 不该在「我以前说过什么」里冒出来。
+        if not a.zone and (r["zone"] or "hot") in HIDDEN_ZONES:
             p_rej_valid += 1
             continue
         p_valid += 1
@@ -1868,6 +1880,11 @@ def cmd_purge(conn, a):
     冷却期同时是撤回入口（--restore）；隐私/错误信息仍可 --now 立即删。
     """
     now_e = datetime.now().timestamp()
+    # --now 是「立即真删」而不是「把本轮新进墓碑的删掉」。先把调用前就已在
+    # 墓碑区的节点记下来，后面要单独计入 purged_existing。
+    preexisting = (conn.execute(
+        "SELECT id,addr FROM nodes WHERE zone='tombstone'").fetchall() if a.now else [])
+    preexisting_ids = {r["id"] for r in preexisting}
     if a.gc:
         # 显式 GC：只回收「全库无人引用」的孤儿正文，只动 blobs 表，不删任何 nodes 行。
         # 不做自动触发 —— 回收是省空间的手段，删除是不可逆的决定，不可逆的事必须有人按。
@@ -1950,21 +1967,30 @@ def cmd_purge(conn, a):
                      "保护位永不硬删（SPEC §3.1）；确需删除先 pin <id> --off")
     else:
         rows = conn.execute("SELECT id,addr FROM nodes WHERE status IN ('superseded','archived')"
-                            " AND pinned=0 AND type!=? AND zone!='tombstone'",
+                            " AND pinned=0 AND type!=? AND COALESCE(zone,'hot') NOT IN ('tombstone','purged')",
                             (ANCHOR,)).fetchall()
-    if not rows:
+    if not rows and not a.now:
         emit(conn, {"tombstoned": 0, "note": "没有可删的候选"})
         return
     for r in rows:
         conn.execute("UPDATE nodes SET zone='tombstone', tombstoned_at=?, purge_reason=? WHERE id=?",
                      (now_e, a.reason, r["id"]))
-    n = n_pinned = n_shared = 0
+    n_pinned = n_shared = 0
     if a.now:   # 隐私/错误信息：跳过冷却，立刻生效（跳过冷却 ≠ 跳过引用计数/保护位）
-        # 每条地址只判一次：同一批里多条共用同一地址时，判定不能依赖遍历顺序
+        all_rows = {r["id"]: r["addr"] for r in preexisting}
+        all_rows.update({r["id"]: r["addr"] for r in rows})
+        if not all_rows:
+            emit(conn, {"purged_now": 0, "purged_existing": 0,
+                        "skipped_pinned": 0, "skipped_shared": 0,
+                        "reason": a.reason, "cooldown_skipped": True,
+                        "note": "没有墓碑节点：库里既没有本轮可进墓碑的候选，也没有冷却中的墓碑"})
+            return
+        # 每条地址只判一次：同一地址上多条墓碑时，判定不能依赖遍历顺序
         # （先走到的那条会看到「后面那条还活着」，报出 skipped 却照样被抹）。
         by_addr = {}
-        for r in rows:
-            by_addr.setdefault(r["addr"], []).append(r["id"])
+        for nid, addr in all_rows.items():
+            by_addr.setdefault(addr, []).append(nid)
+        n_new = n_old = 0
         for addr in sorted(by_addr):
             if pinned_refs(conn, addr) > 0:      # 同一地址上有保护位（含墓碑区）→ 不抹
                 n_pinned += 1
@@ -1972,18 +1998,24 @@ def cmd_purge(conn, a):
             if live_refs(conn, addr) > 0:
                 n_shared += 1
                 continue
-            n += conn.execute("UPDATE blobs SET hot=2, content='' WHERE addr=? AND hot!=2",
-                              (addr,)).rowcount
-            conn.executemany("DELETE FROM affect WHERE node_id=?",
-                             [(i,) for i in by_addr[addr]])
-    conn.commit()
-    if a.now:
-        emit(conn, {"purged_now": n, "skipped_pinned": n_pinned,
+            conn.execute("UPDATE blobs SET hot=2, content='' WHERE addr=? AND hot!=2", (addr,))
+            ids = by_addr[addr]
+            conn.executemany("DELETE FROM affect WHERE node_id=?", [(i,) for i in ids])
+            conn.executemany(
+                "UPDATE nodes SET zone='purged', tombstoned_at=NULL WHERE id=?",
+                [(i,) for i in ids])
+            n_old += sum(1 for i in ids if i in preexisting_ids)
+            n_new += sum(1 for i in ids if i not in preexisting_ids)
+        conn.commit()
+        emit(conn, {"purged_now": n_new, "purged_existing": n_old,
+                    "purged": n_new + n_old,
+                    "skipped_pinned": n_pinned,
                     "skipped_shared": n_shared, "reason": a.reason,
                     "cooldown_skipped": True,
-                    "note": "立即删除：隐私/错误信息不需要冷却，删除不可恢复；"
+                    "note": "立即删除：所有墓碑节点一并抹正文并转 purged 终态；"
                             "保护位/仍被引用的地址不抹正文"})
         return
+    conn.commit()
     emit(conn, {"tombstoned": len(rows), "cooldown_days": PURGE_COOLDOWN_DAYS,
                 "due_at": datetime.fromtimestamp(now_e + PURGE_COOLDOWN_DAYS * 86400).strftime("%Y-%m-%d"),
                 "note": "正文仍在库、已从检索与上下文消失；冷却期内 purge --restore <id> 撤回"})
@@ -2202,8 +2234,10 @@ def cmd_zone(conn, a):
             sys.exit(f"[memtree] 未知分区: {a.set}（可选 {chr(47).join(ZONES)}）")
         r = node(conn, a.id)
         cur = r["zone"] or "hot"
-        if a.set == "tombstone":
-            sys.exit("[memtree] 墓碑区只能由 purge 进入（删除需要理由与冷却），不能用 zone --set")
+        if a.set in HIDDEN_ZONES:
+            sys.exit("[memtree] tombstone/purged 只能由 purge 流程进入，不能用 zone --set")
+        if cur == "purged":
+            sys.exit(f"[memtree] #{a.id} 正文已永久删除，不能改分区")
         if cur == "tombstone":
             sys.exit(f"[memtree] #{a.id} 已在墓碑区（已受理删除）：要用 purge --restore {a.id} 撤回，"
                      "不能用 zone --set 绕过冷却")
@@ -2215,7 +2249,7 @@ def cmd_zone(conn, a):
     if a.migrate:
         moved, blocked = [], 0
         for r in conn.execute("SELECT id,t,zone,importance,pinned,label FROM nodes").fetchall():
-            if (r["zone"] or "hot") == "tombstone":   # 墓碑区不参与时间迁移：它是删除流程，不是老化
+            if (r["zone"] or "hot") in HIDDEN_ZONES:   # 删除流程/终态不参与时间迁移
                 continue
             age = max(0.0, now_e - r["t"]) / 86400.0
             tgt = zone_target(age, r["importance"], r["pinned"], r["label"])

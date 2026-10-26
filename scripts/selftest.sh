@@ -305,7 +305,12 @@ EOF
 )
 $M purge --addr "$TBN2" --now --reason 隐私 >/dev/null
 chk "--now 跳过冷却，立即真删（隐私没有缓冲期）" "c.execute(\"select b.hot from nodes n join blobs b on n.addr=b.addr where n.id=$TBNOW\").fetchone()[0]==2"
-chk "stats 报墓碑待删/到期数" "c.execute(\"select count(*) from nodes where zone='tombstone'\").fetchone()[0]>=2"
+TF23STAT=$(mktemp)
+$M stats >"$TF23STAT"
+SPEND=$("$PY" -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); print(d["tombstone"]["pending"])' "$TF23STAT")
+DPEND=$($PY -c 'import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); print(c.execute("select count(*) from nodes where zone=\"tombstone\"").fetchone()[0])' "$MEMTREE_DB")
+chk "stats 报墓碑待删（与库内实际 pending 一致）" "'$SPEND'=='$DPEND'"
+"$PY" -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert {"pending","due"} <= set(d["tombstone"])' "$TF23STAT" && { PASS=$((PASS+1)); echo "  ok   stats 同时报到期数（due 键存在）"; } || { FAIL=$((FAIL+1)); echo "  FAIL stats 缺 tombstone.due"; }
 
 echo
 echo "[24] 事件内细节梯度压缩（SPEC §5 ①：越新越细，结论必留）"
@@ -1220,6 +1225,24 @@ F1FULL=$("$PY" -c 'import json,sys; print(sorted(h["id"] for h in json.load(open
 chk "F1：expand 99 与 legacy 命中集合一致" "'$F1LEG'=='$F1FULL'"
 F1ERR=$($M recall "项目" --pipeline v2 --top 3 --expand 1 2>&1 >/dev/null)
 echo "$F1ERR" | grep -q "expand 上限丢弃" && { PASS=$((PASS+1)); echo "  ok   F1：非 JSON 截断 warning 打到 stderr"; } || { FAIL=$((FAIL+1)); echo "  FAIL F1：stderr 没报截断（$F1ERR）"; }
+
+echo
+echo "[34] 工单 F2/F4/F5：purge 语义（墓碑期立即删 / 终态 / restore）"
+TF34=$(mktemp -d)
+export MEMTREE_DB="$(mktemp -d)/mt_f2.db"
+$M init >/dev/null
+F2OLD=$($M commit "身份证号 3301xxxx" --subject s --type fact -q)
+F2NEW=$($M commit "身份证号换了 3302yyyy" --subject s --type fact -q)
+chk "F2 前置：两条不同正文都在 blobs（非空=2）" "c.execute(\"select count(*) from blobs where length(content)>0\").fetchone()[0]==2"
+$M purge --reason 常规清理 >/dev/null
+$M purge --now --reason 隐私 >"$TF34/f2_now.json"
+ochk "F2：已在墓碑期的节点也被立即真删" "$TF34/f2_now.json" "json.loads(out)['purged_existing']>=1 and json.loads(out)['purged_now']==0"
+chk "F2：正文数从 2 降到 1（旧条目真被抹）" "c.execute(\"select count(*) from blobs where length(content)>0\").fetchone()[0]==1"
+chk "F2：被删节点不再处于 tombstone" "c.execute(\"select zone from nodes where id=$F2OLD\").fetchone()[0]!='tombstone'"
+$M purge --list >"$TF34/f2_list.json"
+ochk "F2：真删后墓碑列表为 0" "$TF34/f2_list.json" "json.loads(out)['tombstones']==0"
+$M purge --now --reason 隐私 >"$TF34/f2_empty.json"
+ochk "F2：无墓碑时 note 明确说『没有墓碑节点』" "$TF34/f2_empty.json" "json.loads(out)['purged_existing']==0 and '没有墓碑节点' in json.loads(out)['note']"
 
 echo "通过 $PASS / 失败 $FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
