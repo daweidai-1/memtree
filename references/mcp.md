@@ -36,7 +36,7 @@ MCP 注解建议：
 | 工具 | `readOnlyHint` | `destructiveHint` | `idempotentHint` |
 |---|---|---|---|
 | `memtree_commit` | false | false | false |
-| `memtree_recall` | false | false | true |
+| `memtree_recall` | false | false | false |
 | `memtree_context` | true | false | true |
 | `memtree_purge` | false | **true** | false |
 
