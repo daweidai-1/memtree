@@ -1511,7 +1511,7 @@ def cmd_recall(conn, a):
                 best[subj] = (r["t"], r["id"])
         cur_ids = {v[1] for v in best.values()}
 
-    hits = []
+    raw_hits = []
     _now_e = datetime.now().timestamp()
     for r in conn.execute("SELECT * FROM nodes"):
         # 契约 G2：T 早于条目 t 时同样不返回该条 —— t 还在未来的条目，在任何 --at 视角下
@@ -1581,8 +1581,17 @@ def cmd_recall(conn, a):
         so = r_ref * float(r["outcome"] or 0.0)          # r_q·r_m，r_q 默认 0 → 休眠
         se = dot(e_q, unpack_real(r["v_text"]))          # cos(e_q, e_m)
         emo, _emo_row = affect_relevance(amap.get(r["id"], []), qtags)
-        # 情绪维只在显式查询时激活；α=0.5 时时间与情绪并为主权重。
-        primary = ((1.0 - emo_alpha) * st + emo_alpha * emo) if qtags else st
+        raw_hits.append((r, se, st, so, emo))
+    # 情绪零命中必须降级，不许把全库分数腰斩：只有候选集里至少一条真的有
+    # 相关情感观察时，α 才生效；否则退回纯时间权重，并明确告警。
+    emotion_matched = sum(1 for _r, _se, _st, _so, emo in raw_hits if emo > 0) if qtags else 0
+    emo_alpha_applied = emo_alpha if (qtags and emotion_matched > 0) else 0.0
+    if qtags and emotion_matched == 0:
+        print(f"[memtree] 情绪标签 {','.join(qtags)} 在本库零命中，本次未启用情绪权重。",
+              file=sys.stderr)
+    hits = []
+    for r, se, st, so, emo in raw_hits:
+        primary = ((1.0 - emo_alpha_applied) * st + emo_alpha_applied * emo) if qtags else st
         s = se * (primary + so) if a.mode == "and" else se * (0.5 + 0.5 * primary) + 0.3 * so
         hits.append((s, r, se, st, so, emo))
     hits.sort(key=lambda x: -x[0])
@@ -1622,7 +1631,7 @@ def cmd_recall(conn, a):
             tset = set(_terms(body))
             ov = (len(qset & tset) / float(len(qset))) if qset else 0.0
             sim = 0.85 * se + 0.15 * ov
-            primary = ((1.0 - emo_alpha) * st + emo_alpha * emo) if qtags else st
+            primary = ((1.0 - emo_alpha_applied) * st + emo_alpha_applied * emo) if qtags else st
             s2 = sim * (primary + so) if a.mode == "and" else sim * (0.5 + 0.5 * primary) + 0.3 * so
             reranked.append((s2, r, se, st, so, emo))
         reranked.sort(key=lambda x: -x[0])
@@ -1638,8 +1647,9 @@ def cmd_recall(conn, a):
                              "pruned": p_event_pruned, "out": p_event},
             "similarity": {"coarse": "vector_cos", "hybrid": "0.85*cos+0.15*lexical",
                            "candidates": p_event, "kept": len(hits)},
-            "ranking": {"time": round(1.0 - emo_alpha if qtags else 1.0, 3),
-                        "emotion": round(emo_alpha if qtags else 0.0, 3),
+            "ranking": {"time": round(1.0 - emo_alpha_applied if qtags else 1.0, 3),
+                        "emotion": round(emo_alpha_applied if qtags else 0.0, 3),
+                        "emotion_matched": emotion_matched,
                         "outcome": 1.0},
             "expand": {"units": len(units), "units_expanded": len(chosen),
                        "units_skipped": units_skipped,
@@ -1704,6 +1714,9 @@ def cmd_recall(conn, a):
             hits_out.append(hit)
         out = {"query": q_text, "t": a.at or now_iso(), "outcome": r_ref, "hits": hits_out}
         if qtags:
+            out["emotion"] = {"tags": qtags, "matched": emotion_matched,
+                              "alpha_applied": emo_alpha_applied}
+            # 兼容旧字段：alpha 报请求值，实际是否生效看 emotion.alpha_applied。
             out["emotion_query"] = {"tags": qtags, "alpha": emo_alpha}
         if pipe_info:
             out["pipeline"] = pipe_info

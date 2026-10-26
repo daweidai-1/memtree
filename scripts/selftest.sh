@@ -1156,6 +1156,20 @@ EOF
 $M context --budget 500 >/dev/null 2>&1; MRC=$?
 chk "缺情感列的老库能直接打开" "'$MRC'=='0'"
 chk "老库 signals 情感列已由 _migrate 补回" "\"emotion_tags\" in [r[1] for r in c.execute(\"PRAGMA table_info(signals)\")] and \"valence\" in [r[1] for r in c.execute(\"PRAGMA table_info(signals)\")]"
+# F3：情绪标签零命中不得把全库分数腰斩，必须退回 α=0 并明确告警。
+export MEMTREE_DB="$(mktemp -d)/mt_f3.db"
+$M init >/dev/null
+F3N=$($M commit "F3 咖啡记录" --type fact --subject f3.coffee --ts "2026-10-20T10:00:00+08:00" -q)
+$M recall "咖啡记录" --json >"$TF32/f3_base.json"
+$M recall "咖啡记录" --emotion joy --json >"$TF32/f3_zero.json" 2>"$TF32/f3_zero.err"
+ochk "F3：零命中上报 matched=0 / alpha_applied=0" "$TF32/f3_zero.json" "(lambda e: e['tags']==['joy'] and e['matched']==0 and e['alpha_applied']==0.0)(json.loads(out)['emotion'])"
+F3BASE=$("$PY" -c 'import json,sys; print([h["score"] for h in json.load(open(sys.argv[1],encoding="utf-8"))["hits"]])' "$TF32/f3_base.json")
+F3ZERO=$("$PY" -c 'import json,sys; print([h["score"] for h in json.load(open(sys.argv[1],encoding="utf-8"))["hits"]])' "$TF32/f3_zero.json")
+chk "F3：零命中分数与不带 --emotion 逐位相同" "'$F3BASE'=='$F3ZERO'"
+grep -q "情绪标签 joy 在本库零命中" "$TF32/f3_zero.err" && { PASS=$((PASS+1)); echo "  ok   F3：零命中在 stderr 明确告警"; } || { FAIL=$((FAIL+1)); echo "  FAIL F3：零命中没有告警"; }
+$M affect set "$F3N" --tags 喜悦 --intensity 1.0 >/dev/null
+$M recall "咖啡记录" --emotion joy --json >"$TF32/f3_hit.json"
+ochk "F3：部分命中保持 α=0.5 并报 matched=1" "$TF32/f3_hit.json" "(lambda e: e['matched']==1 and e['alpha_applied']==0.5)(json.loads(out)['emotion'])"
 
 echo
 echo "[33] SPEC §8.3 分层检索 v2（剪枝 → 事件过滤 → 混合相似度 → 加权排序 → 逐级展开）"
