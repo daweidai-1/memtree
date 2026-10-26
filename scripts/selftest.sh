@@ -1097,5 +1097,65 @@ $M compress --min-count 1 --keep-detail 0 >"$TF31/legacy.json" 2>&1; LRC=$?
 chk "缺 importance 的老库能直接打开并走完 compress" "'$LRC'=='0'"
 chk "老库 importance 列已由 _migrate 补回" "\"importance\" in [r[1] for r in c.execute(\"PRAGMA table_info(nodes)\")]"
 
+echo
+echo "[32] SPEC §7 情感层：结构化 affect + 显式情绪检索 + 隐私级联"
+TF32=$(mktemp -d)
+export MEMTREE_DB="$(mktemp -d)/mt_selftest32.db"
+$M init >/dev/null
+E32=$($M commit "和老大一起看电影，很温暖" --type event --event 观影 --ts "2026-09-01T20:00:00+08:00" -q)
+$M signal "$E32" --type emotional_peak --intensity 0.9 --tags 喜悦,信任 --valence 0.8 --quote "那晚真好" >"$TF32/sig.json"
+ochk "signal 落库标签已规范化（中文别名→joy/trust）" "$TF32/sig.json" "json.loads(out)['tags']==['joy','trust']"
+chk "signal 保存效价与强度" "c.execute(\"select emotion_tags,valence,intensity from signals where node_id=$E32\").fetchone()[:3]==('[\"joy\", \"trust\"]',0.8,0.9)"
+$M settle --json >"$TF32/settle.json"
+chk "settle 写出结构化 affect，不再只靠 quote" "c.execute(\"select count(*) from affect where node_id=$E32\").fetchone()[0]==1"
+chk "affect 标签/强度/效价/原话齐全" "tuple(c.execute(\"select tags,intensity,valence,key_quote,source from affect where node_id=$E32\").fetchone())==('[\"joy\", \"trust\"]',0.9,0.8,'那晚真好','stated')"
+ochk "settle --json 报 affect_written" "$TF32/settle.json" "$E32 in json.loads(out)['affect_written']"
+$M signal "$E32" --type emotional_peak --intensity 0.4 --tags 开心 --valence 0.2 --quote "补一条" >/dev/null
+$M settle >/dev/null
+chk "同一记忆可有多条情感观察（演变不被覆盖）" "c.execute(\"select count(*) from affect where node_id=$E32\").fetchone()[0]==2"
+$M affect show "$E32" --json >"$TF32/show.json"
+ochk "affect show 倒序给出全部观察" "$TF32/show.json" "len(json.loads(out)['affect'])==2 and json.loads(out)['affect'][0]['intensity']==0.4"
+UNK=$($M affect set "$E32" --tags 不存在 --intensity 0.5 2>&1); URC=$?
+chk "未知情感标签当场拒绝（不静默丢弃）" "'$URC'!='0'"
+RP=$($M commit "角色扮演台词" --type event --source roleplay -q)
+$M signal "$RP" --type emotional_peak --intensity 0.99 --tags 恐惧 --quote "虚构台词" >/dev/null
+$M settle >/dev/null
+chk "roleplay 情绪再高也不落 affect（防虚构污染）" "c.execute(\"select count(*) from affect where node_id=$RP\").fetchone()[0]==0"
+RPRC=$($M affect set "$RP" --tags 恐惧 --intensity 0.9 2>&1); RPRC_CODE=$?
+chk "affect set 也拒绝 roleplay 来源" "'$RPRC_CODE'!='0'"
+# 同语义、同时间的两条：只有一条有 joy 情感观察，显式 --emotion 必须把它排上来。
+A32=$($M commit "旅行记录 同一句话" --type event --event 旅行 --ts "2026-09-10T10:00:00+08:00" -q)
+B32=$($M commit "旅行记录 同一句话" --type event --event 旅行 --ts "2026-09-10T10:00:00+08:00" -q)
+$M affect set "$B32" --tags 喜悦 --intensity 1.0 --valence 0.9 --quote "很开心" >/dev/null
+$M recall "旅行记录" --top 2 --json >"$TF32/base.json"
+$M recall "旅行记录" --emotion 喜悦 --top 2 --json >"$TF32/emo.json"
+ochk "无 --emotion 时输出不新增 emotion/affect 键（老契约不变）" "$TF32/base.json" "('emotion' not in json.loads(out)['hits'][0]) and ('affect' not in json.loads(out)['hits'][0])"
+ochk "有 --emotion 时带命中重新排序，情感记忆到第一" "$TF32/emo.json" "json.loads(out)['hits'][0]['id']==$B32 and json.loads(out)['hits'][0]['emotion']==1.0"
+ochk "情绪查询回显 tags 与 α" "$TF32/emo.json" "json.loads(out)['emotion_query']=={'tags':['joy'],'alpha':0.5}"
+$M affect set "$A32" --tags 悲伤 --intensity 0.2 --source inferred >/dev/null
+$M affect clear "$A32" >"$TF32/clear.json"
+chk "affect clear 只清情感观察、不删记忆" "c.execute(\"select count(*) from affect where node_id=$A32\").fetchone()[0]==0 and c.execute(\"select status from nodes where id=$A32\").fetchone()[0]=='active'"
+P32=$($M commit "隐私：带情绪的错误记录" --type event -q)
+$M affect set "$P32" --tags 愤怒 --intensity 0.8 --quote "不该留的原话" >/dev/null
+P32ADDR=$("$PY" - "$MEMTREE_DB" "$P32" <<'EOF'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+print(c.execute("select addr from nodes where id=?", (int(sys.argv[2]),)).fetchone()[0])
+EOF
+)
+$M purge --addr "$P32ADDR" --now --reason 隐私 >/dev/null
+chk "purge 真删时级联删除 affect（标签与原话不残留）" "c.execute(\"select count(*) from affect where node_id=$P32\").fetchone()[0]==0"
+chk "affect 表里不残留被删原话" "c.execute(\"select count(*) from affect where key_quote like '%不该留%'\").fetchone()[0]==0"
+"$PY" - "$MEMTREE_DB" <<'EOF'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+c.execute("ALTER TABLE signals DROP COLUMN emotion_tags")
+c.execute("ALTER TABLE signals DROP COLUMN valence")
+c.commit()
+EOF
+$M context --budget 500 >/dev/null 2>&1; MRC=$?
+chk "缺情感列的老库能直接打开" "'$MRC'=='0'"
+chk "老库 signals 情感列已由 _migrate 补回" "\"emotion_tags\" in [r[1] for r in c.execute(\"PRAGMA table_info(signals)\")] and \"valence\" in [r[1] for r in c.execute(\"PRAGMA table_info(signals)\")]"
+
 echo "通过 $PASS / 失败 $FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

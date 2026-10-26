@@ -65,6 +65,21 @@ PERSONA_TITLE_TO_SLOT = {v: k for k, v in PERSONA_TITLES.items()}
 PERSONA_LABELS = {"hard": "硬", "soft": "软", "var": "可变"}
 PERSONA_SLOT_BUDGET = {"hard": 300, "soft": 350, "var": 150}
 PERSONA_TOTAL_BUDGET = 800
+# 情感层（SPEC §7）：固定 8 类 + 未标注。标签是内容属性，不是访问次数；
+# 只在显式 --emotion 查询时进入排序，绝不参与覆盖、分区、压缩或保留时长。
+AFFECT_TAGS = ("joy", "trust", "surprise", "sadness",
+               "fear", "anger", "disgust", "anticipation", "unspecified")
+AFFECT_TAG_ALIASES = {
+    "喜悦": "joy", "开心": "joy", "高兴": "joy", "快乐": "joy",
+    "信任": "trust", "信赖": "trust",
+    "惊讶": "surprise", "意外": "surprise",
+    "悲伤": "sadness", "难过": "sadness", "伤心": "sadness",
+    "恐惧": "fear", "害怕": "fear", "焦虑": "fear",
+    "愤怒": "anger", "生气": "anger", "恼火": "anger",
+    "厌恶": "disgust", "反感": "disgust",
+    "期待": "anticipation", "盼望": "anticipation",
+    "未标注": "unspecified",
+}
 
 
 # ------------------------------------------------------------------ 记忆的数学形式
@@ -279,10 +294,27 @@ def _schema(conn):
             type      TEXT    NOT NULL,   -- user_confirm|correction|emotional_peak|repeat_mention
             intensity REAL    NOT NULL DEFAULT 0,
             quote     TEXT,
+            emotion_tags TEXT,             -- 受控词表 JSON 数组（SPEC §7）
+            valence   REAL    NOT NULL DEFAULT 0,
             at        TEXT    NOT NULL,
             settled   INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_sig ON signals(node_id, settled);
+
+        -- 情感观察（SPEC §7）：一条记忆可以有多次情绪记录，nodes.label 只保留
+        -- 「是不是情感锚点」这一个结算结论，不再承担完整的情绪语义。
+        CREATE TABLE IF NOT EXISTS affect(
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            node_id    INTEGER NOT NULL,
+            t          REAL NOT NULL,
+            tags       TEXT NOT NULL,          -- JSON 数组，规范顺序、去重
+            intensity  REAL NOT NULL DEFAULT 0,
+            valence    REAL NOT NULL DEFAULT 0,
+            key_quote  TEXT,
+            source     TEXT NOT NULL DEFAULT 'stated',
+            created_at REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_affect_node ON affect(node_id, t DESC);
 
         -- 结算审计：没有这张表，"为什么这条被打成重要"就不可回答
         CREATE TABLE IF NOT EXISTS settle_log(
@@ -364,6 +396,21 @@ def _migrate(conn):
         if name not in cols:
             conn.execute(f"ALTER TABLE nodes ADD COLUMN {name} {ddl}")
             added.add(name)
+    conn.commit()
+    # 情感层补列/建表：老库的 signals 没有 tags/valence，affect 表也不存在。
+    # 列必须先补，再建依赖它的索引/表（与 event 索引同一条铁律）。
+    scols = {r["name"] for r in conn.execute("PRAGMA table_info(signals)")}
+    for name, ddl in (("emotion_tags", "TEXT"),
+                      ("valence", "REAL NOT NULL DEFAULT 0")):
+        if name not in scols:
+            conn.execute(f"ALTER TABLE signals ADD COLUMN {name} {ddl}")
+    conn.execute("""CREATE TABLE IF NOT EXISTS affect(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    node_id INTEGER NOT NULL, t REAL NOT NULL,
+                    tags TEXT NOT NULL, intensity REAL NOT NULL DEFAULT 0,
+                    valence REAL NOT NULL DEFAULT 0, key_quote TEXT,
+                    source TEXT NOT NULL DEFAULT 'stated', created_at REAL NOT NULL)""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_affect_node ON affect(node_id, t DESC)")
     conn.commit()
     if "gone_at" in added:
         # 老库只记了「现在是什么 status」，没记「什么时候不再是现状」。回溯必须靠后者，
@@ -512,6 +559,131 @@ def _cold_blob(conn, addr):
 def emit(conn, obj, quiet=False):
     if not quiet:
         print(json.dumps(obj, ensure_ascii=False))
+
+
+# ------------------------------------------------------------------ 情感层（SPEC §7）
+def normalize_affect_tags(raw):
+    """把 CLI 输入规范成受控词表；未知标签直接拒绝，不做静默丢弃。"""
+    if raw is None:
+        return []
+    if isinstance(raw, (list, tuple)):
+        parts = [str(x) for x in raw]
+    else:
+        parts = [x for x in re.split(r"[,，;；\s]+", str(raw).strip()) if x]
+    out = set()
+    for p in parts:
+        key = p.strip().lower()
+        key = AFFECT_TAG_ALIASES.get(p.strip(), AFFECT_TAG_ALIASES.get(key, key))
+        if key not in AFFECT_TAGS:
+            sys.exit(f"[memtree] 未知情感标签: {p}（可选 {', '.join(AFFECT_TAGS)}，也接受常见中文别名）")
+        out.add(key)
+    order = {t: i for i, t in enumerate(AFFECT_TAGS)}
+    return sorted(out, key=lambda x: order[x])
+
+
+def affect_parse_tags(raw):
+    try:
+        tags = json.loads(raw or "[]")
+    except (TypeError, ValueError):
+        tags = []
+    return [t for t in tags if t in AFFECT_TAGS]
+
+
+def affect_add(conn, node_id, tags, intensity=0.0, valence=0.0,
+               key_quote=None, source="stated", t=None):
+    """落一条不可变的情感观察。调用方负责 source=roleplay 的过滤。"""
+    tags = normalize_affect_tags(tags)
+    if not tags:
+        tags = ["unspecified"]
+    now_e = datetime.now().timestamp()
+    conn.execute(
+        """INSERT INTO affect(node_id,t,tags,intensity,valence,key_quote,source,created_at)
+           VALUES(?,?,?,?,?,?,?,?)""",
+        (int(node_id), float(t if t is not None else now_e),
+         json.dumps(tags, ensure_ascii=False), float(intensity), float(valence),
+         key_quote, source or "stated", now_e))
+
+
+def affect_relevance(rows, qtags):
+    """情绪相关性：命中查询标签的比例 × 强度 × 来源可信度；返回 (分数, 最佳行)。"""
+    if not qtags or not rows:
+        return 0.0, None
+    q = set(qtags)
+    src_weight = {"stated": 1.0, "inferred": 0.5, "system": 0.5, "roleplay": 0.0}
+    best, best_row = 0.0, None
+    for r in rows:
+        tags = affect_parse_tags(r["tags"])
+        if not tags:
+            continue
+        overlap = len(q & set(tags)) / float(len(q))
+        score = overlap * max(0.0, min(1.0, float(r["intensity"] or 0.0)))
+        score *= src_weight.get(r["source"] or "stated", 1.0)
+        if score > best:
+            best, best_row = score, r
+    return best, best_row
+
+
+def affect_map(conn):
+    out = {}
+    for r in conn.execute("SELECT * FROM affect ORDER BY node_id, t DESC, id DESC"):
+        out.setdefault(r["node_id"], []).append(r)
+    return out
+
+
+def cmd_affect(conn, a):
+    act = a.action
+    if act == "set":
+        nrow = node(conn, a.node)
+        if a.source == "roleplay" or (nrow["source_type"] or "stated") == "roleplay":
+            sys.exit("[memtree] roleplay 内容不进入情感层（防虚构污染）")
+        tags = normalize_affect_tags(a.tags)
+        if not tags:
+            sys.exit("[memtree] affect set 需要 --tags")
+        inten = _range(a.intensity, 0.0, 1.0, "--intensity") if a.intensity is not None else 0.0
+        val = _range(a.valence, -1.0, 1.0, "--valence") if a.valence is not None else 0.0
+        affect_add(conn, a.node, tags, inten, val, a.quote, a.source,
+                   parse_ts(a.ts).timestamp() if a.ts else None)
+        conn.commit()
+        emit(conn, {"node": a.node, "tags": tags, "intensity": inten,
+                    "valence": val, "source": a.source})
+        return
+    if act == "show":
+        node(conn, a.node)
+        rows = conn.execute("SELECT * FROM affect WHERE node_id=? ORDER BY t DESC, id DESC",
+                            (a.node,)).fetchall()
+        items = [{"id": r["id"], "t": now_iso(datetime.fromtimestamp(r["t"]).astimezone()),
+                  "tags": affect_parse_tags(r["tags"]), "intensity": r["intensity"],
+                  "valence": r["valence"], "quote": r["key_quote"], "source": r["source"]}
+                 for r in rows]
+        if a.json:
+            emit(conn, {"node": a.node, "affect": items})
+        else:
+            print(f"#{a.node} 情感 {len(items)} 条")
+            for x in items:
+                print(f"  {x['t'][:16]}  {','.join(x['tags']) or '-'}  "
+                      f"intensity={x['intensity']:.2f} valence={x['valence']:+.2f}"
+                      f"  {x['quote'] or ''}")
+        return
+    if act == "list":
+        qtags = set(normalize_affect_tags(a.tags)) if a.tags else set()
+        rows = conn.execute("SELECT * FROM affect ORDER BY t DESC, id DESC LIMIT ?",
+                            (a.limit,)).fetchall()
+        items = []
+        for r in rows:
+            tags = affect_parse_tags(r["tags"])
+            if qtags and not qtags.intersection(tags):
+                continue
+            items.append({"node": r["node_id"], "tags": tags,
+                          "intensity": r["intensity"], "valence": r["valence"],
+                          "quote": r["key_quote"], "source": r["source"]})
+        emit(conn, {"affect": items, "count": len(items)})
+        return
+    if act == "clear":
+        node(conn, a.node)
+        n = conn.execute("DELETE FROM affect WHERE node_id=?", (a.node,)).rowcount
+        conn.commit()
+        emit(conn, {"node": a.node, "cleared": n})
+        return
 
 
 # ------------------------------------------------------------------ 权重
@@ -855,14 +1027,22 @@ def cmd_signal(conn, a):
     node(conn, a.node)
     if a.type not in SIGNAL_TYPES:
         sys.exit(f"[memtree] 未知信号类型: {a.type}（可选 {', '.join(SIGNAL_TYPES)}）")
-    conn.execute("INSERT INTO signals(node_id,type,intensity,quote,at,settled) VALUES(?,?,?,?,?,0)",
-                 (a.node, a.type, float(a.intensity or 0.0), a.quote, now_iso()))
+    tags = normalize_affect_tags(a.tags) if getattr(a, "tags", None) else []
+    if tags and a.type != "emotional_peak":
+        sys.exit("[memtree] 只有 emotional_peak 信号可以带 --tags")
+    inten = _range(a.intensity, 0.0, 1.0, "--intensity") if a.intensity is not None else 0.0
+    val = _range(a.valence, -1.0, 1.0, "--valence") if getattr(a, "valence", None) is not None else 0.0
+    conn.execute("""INSERT INTO signals(node_id,type,intensity,quote,emotion_tags,valence,at,settled)
+                    VALUES(?,?,?,?,?,?,?,0)""",
+                 (a.node, a.type, inten, a.quote,
+                  json.dumps(tags, ensure_ascii=False) if tags else None, val, now_iso()))
     conn.execute("UPDATE nodes SET accessed_at=? WHERE id=?",
                  (datetime.now().timestamp(), a.node))
     conn.commit()
     pend = conn.execute("SELECT COUNT(*) c FROM signals WHERE node_id=? AND settled=0",
                         (a.node,)).fetchone()["c"]
-    emit(conn, {"node": a.node, "signal": a.type, "pending": pend})
+    emit(conn, {"node": a.node, "signal": a.type, "pending": pend,
+                "tags": tags, "intensity": inten, "valence": val})
 
 
 def _judge(conn, nid):
@@ -896,12 +1076,31 @@ def cmd_settle(conn, a):
     """
     ids = [r["node_id"] for r in conn.execute(
         "SELECT DISTINCT node_id FROM signals WHERE settled=0")]
-    changed = []
+    changed, affect_written = [], []
     for nid in ids:
-        row = conn.execute("SELECT id,label,pinned FROM nodes WHERE id=?", (nid,)).fetchone()
+        row = conn.execute("SELECT id,label,pinned,source_type FROM nodes WHERE id=?",
+                           (nid,)).fetchone()
         if not row:
             conn.execute("UPDATE signals SET settled=1 WHERE node_id=?", (nid,))
             continue
+        src = row["source_type"] or "stated"
+        # 情感观察先落结构化表，再结算 label：label 只回答「是不是情感锚点」，
+        # affect 才保存标签、强度、效价和原话，二者不是同一层信息。
+        srows = conn.execute(
+            """SELECT type,intensity,quote,emotion_tags,valence FROM signals
+               WHERE node_id=? AND settled=0 AND type='emotional_peak'
+               ORDER BY id""", (nid,)).fetchall()
+        if srows and src != "roleplay":
+            tags = set()
+            for s in srows:
+                for t in affect_parse_tags(s["emotion_tags"]):
+                    tags.add(t)
+            peak = max(float(s["intensity"] or 0.0) for s in srows)
+            best = max(srows, key=lambda s: float(s["intensity"] or 0.0))
+            vals = [float(s["valence"] or 0.0) for s in srows]
+            affect_add(conn, nid, sorted(tags) if tags else ["unspecified"], peak,
+                       sum(vals) / len(vals), best["quote"], src)
+            affect_written.append(nid)
         label, reason = _judge(conn, nid)
         old_pin, old_label = int(row["pinned"] or 0), row["label"]
         new_pin = old_pin
@@ -920,7 +1119,8 @@ def cmd_settle(conn, a):
         conn.execute("UPDATE signals SET settled=1 WHERE node_id=? AND settled=0", (nid,))
     conn.commit()
     if a.json:
-        emit(conn, {"scanned": len(ids), "changed": changed})
+        emit(conn, {"scanned": len(ids), "changed": changed,
+                    "affect_written": affect_written})
     else:
         if not changed:
             print(f"[settle] 扫描 {len(ids)} 条，无一条达阈值")
@@ -1262,6 +1462,11 @@ def cmd_recall(conn, a):
         t_ref = datetime.now().timestamp()
     r_ref = a.outcome if a.outcome is not None else 0.0
     e_q = text_vec(q_text)
+    qtags = normalize_affect_tags(a.emotion) if getattr(a, "emotion", None) else []
+    if getattr(a, "emotion", None) and not qtags:
+        sys.exit("[memtree] --emotion 需要至少一个情感标签")
+    emo_alpha = _range(getattr(a, "emotion_weight", 0.5), 0.0, 1.0, "--emotion-weight")
+    amap = affect_map(conn) if qtags else {}
 
     want = {"active", "competing"} if a.status == "auto" else \
            {"active", "competing", "superseded", "archived"} if a.status == "any" else {a.status}
@@ -1343,8 +1548,11 @@ def cmd_recall(conn, a):
         st = time_weight(r["t"], t_ref)                  # t_q·t_m，t_q≡1
         so = r_ref * float(r["outcome"] or 0.0)          # r_q·r_m，r_q 默认 0 → 休眠
         se = dot(e_q, unpack_real(r["v_text"]))          # cos(e_q, e_m)
-        s = se * (st + so) if a.mode == "and" else se * (0.5 + 0.5 * st) + 0.3 * so
-        hits.append((s, r, se, st, so))
+        emo, _emo_row = affect_relevance(amap.get(r["id"], []), qtags)
+        # 情绪维只在显式查询时激活；α=0.5 时时间与情绪并为主权重。
+        primary = ((1.0 - emo_alpha) * st + emo_alpha * emo) if qtags else st
+        s = se * (primary + so) if a.mode == "and" else se * (0.5 + 0.5 * primary) + 0.3 * so
+        hits.append((s, r, se, st, so, emo))
     hits.sort(key=lambda x: -x[0])
     # 语义完全不重合（se=0）时 Σ 也是 0：那不是命中，是噪声。
     # 打 5 条 Σ=+0.000 的假命中，比说"没查到"更贵 —— 它会诱导模型编出解释。
@@ -1360,13 +1568,13 @@ def cmd_recall(conn, a):
     # 命中要给出的那段话（见 readable）：词面重合也用它算。
     # 正文已被抹掉、退到摘要的节点，若拿占位符去算重合，会误报
     # 「无词面重合·低置信」—— 那也是谎：明明有摘要可读。
-    rd = {row["id"]: readable(conn, row) for s, row, se, st, so in top}
+    rd = {row["id"]: readable(conn, row) for s, row, se, st, so, emo in top}
 
     def _ov(row):
         tset = set(_terms(rd[row["id"]][0]))
         return (len(qset & tset) / float(len(qset))) if qset else 0.0
 
-    ovmap = {row["id"]: _ov(row) for s, row, se, st, so in top}
+    ovmap = {row["id"]: _ov(row) for s, row, se, st, so, emo in top}
 
     if top:
         # 访问热度（SPEC §4）：只记"距上次访问"，绝不累计调用次数 ——
@@ -1376,9 +1584,9 @@ def cmd_recall(conn, a):
         conn.commit()
     if a.json:
         hits_out = []
-        for s, r, se, st, so in top:
+        for s, r, se, st, so, emo in top:
             body, how = rd[r["id"]]
-            hits_out.append({
+            hit = {
                 "id": r["id"], "score": round(s, 3), "sem": round(se, 2), "time": round(st, 2),
                 "out": round(so, 2),
                 # --at 视角下报「当时」的 status：当时还是现状就是 active，
@@ -1398,8 +1606,18 @@ def cmd_recall(conn, a):
                 "summary_of": how.get("summary_of"),
                 "summarized_into": how.get("summarized_into"),
                 "content_cleared": bool(how.get("cleared")),
-                "ts": r["ts_iso"]})
+                "ts": r["ts_iso"]}
+            if qtags:
+                _e, _row = affect_relevance(amap.get(r["id"], []), qtags)
+                hit["emotion"] = round(emo, 2)
+                hit["affect"] = ({"tags": affect_parse_tags(_row["tags"]),
+                                  "intensity": _row["intensity"], "valence": _row["valence"],
+                                  "quote": _row["key_quote"], "source": _row["source"]}
+                                 if _row else None)
+            hits_out.append(hit)
         out = {"query": q_text, "t": a.at or now_iso(), "outcome": r_ref, "hits": hits_out}
+        if qtags:
+            out["emotion_query"] = {"tags": qtags, "alpha": emo_alpha}
         if at_mode:
             out["as_of"] = a.at
             out["as_of_stats"] = {"active": n_at, "not_yet": n_not_yet,
@@ -1427,7 +1645,7 @@ def cmd_recall(conn, a):
     if top and all(v == 0.0 for v in ovmap.values()):
         print("(低置信) 没有任何词面重合 —— 下面的命中来自随机投影的噪声相似度，别当证据。")
 
-    for s, r, se, st, so in top:
+    for s, r, se, st, so, emo in top:
         if at_mode:                                  # 回溯视角：以"当时"论现状
             if r["subject"]:
                 is_cur = r["id"] in cur_ids
@@ -1453,8 +1671,9 @@ def cmd_recall(conn, a):
             tag = " ❄冷·正文照读"
         else:
             tag = ""
+        emo_tag = f" emo·{emo:.2f}" if qtags else ""
         print(f"{bar(s)} #{r['id']:<3} {glyph} {short_date(r['t'])} "
-              f"t·{st:.2f} r·{so:+.2f} sem{se:+.2f} Σ={s:+.3f} → "
+              f"t·{st:.2f} r·{so:+.2f} sem{se:+.2f}{emo_tag} Σ={s:+.3f} → "
               f"{clip(body, a.width)}{tag}"
               f"{' ⟦' + r['event'] + '⟧' if r['event'] else ''}"
               f"{' 「无词面重合·低置信」' if ovmap[r['id']] == 0.0 else ''} {flag}")
@@ -1597,6 +1816,9 @@ def cmd_purge(conn, a):
                 continue
             n += conn.execute("UPDATE blobs SET hot=2, content='' WHERE addr=? AND hot!=2",
                               (r["addr"],)).rowcount
+            # 隐私级联：节点行保留作悬空地址，但情绪标签/原话必须一起消失，
+            # 否则 purge 只删了正文、情感观察还留在 affect 表里。
+            conn.execute("DELETE FROM affect WHERE node_id=?", (r["id"],))
         conn.commit()
         waiting = conn.execute("SELECT COUNT(*) c FROM nodes WHERE zone='tombstone'").fetchone()["c"]
         emit(conn, {"purged": n, "due": len(due), "skipped_pinned": skipped_pinned,
@@ -1629,7 +1851,10 @@ def cmd_purge(conn, a):
     if a.now:   # 隐私/错误信息：跳过冷却，立刻生效（跳过冷却 ≠ 跳过引用计数/保护位）
         # 每条地址只判一次：同一批里多条共用同一地址时，判定不能依赖遍历顺序
         # （先走到的那条会看到「后面那条还活着」，报出 skipped 却照样被抹）。
-        for addr in {r["addr"] for r in rows}:
+        by_addr = {}
+        for r in rows:
+            by_addr.setdefault(r["addr"], []).append(r["id"])
+        for addr in sorted(by_addr):
             if pinned_refs(conn, addr) > 0:      # 同一地址上有保护位（含墓碑区）→ 不抹
                 n_pinned += 1
                 continue
@@ -1638,6 +1863,8 @@ def cmd_purge(conn, a):
                 continue
             n += conn.execute("UPDATE blobs SET hot=2, content='' WHERE addr=? AND hot!=2",
                               (addr,)).rowcount
+            conn.executemany("DELETE FROM affect WHERE node_id=?",
+                             [(i,) for i in by_addr[addr]])
     conn.commit()
     if a.now:
         emit(conn, {"purged_now": n, "skipped_pinned": n_pinned,
@@ -2000,6 +2227,23 @@ def main(argv=None):
     s.add_argument("--type", required=True, choices=list(SIGNAL_TYPES))
     s.add_argument("--intensity", type=float, default=0.0)
     s.add_argument("--quote", help="用户原话（关键金句）")
+    s.add_argument("--tags", help="情感标签（仅 emotional_peak；逗号分隔，中文别名可用）")
+    s.add_argument("--valence", type=float, help="效价 [-1,1]：负=难受，正=愉快")
+
+    s = add("affect", cmd_affect, "情感观察：set/show/list/clear（结构化标签+强度+效价）")
+    sa = s.add_subparsers(dest="action", required=True)
+    q = sa.add_parser("set", help="给记忆加一条情感观察")
+    q.add_argument("node", type=int); q.add_argument("--tags", required=True)
+    q.add_argument("--intensity", type=float); q.add_argument("--valence", type=float)
+    q.add_argument("--quote"); q.add_argument("--ts")
+    q.add_argument("--source", default="stated",
+                   choices=["stated", "roleplay", "inferred", "system"])
+    q = sa.add_parser("show", help="看一条记忆的全部情感观察")
+    q.add_argument("node", type=int); q.add_argument("--json", action="store_true")
+    q = sa.add_parser("list", help="按时间列出情感观察")
+    q.add_argument("--tags"); q.add_argument("--limit", type=int, default=30)
+    q = sa.add_parser("clear", help="清掉一条记忆的全部情感观察")
+    q.add_argument("node", type=int)
 
     s = add("settle", cmd_settle, "日终结算：signals → label（一次性 + 审计）")
     s.add_argument("--json", action="store_true")
@@ -2041,6 +2285,9 @@ def main(argv=None):
                    help="and=内积定位（默认），mix=语义优先（时间只做微调）")
     s.add_argument("--branch"); s.add_argument("--top", type=int, default=5)
     s.add_argument("--status", default="auto", choices=["auto", "active", "any", "superseded", "archived", "competing"])
+    s.add_argument("--emotion", help="情绪相关性：查询标签（逗号分隔）；不填则情绪维休眠")
+    s.add_argument("--emotion-weight", type=float, default=0.5,
+                   help="情绪权重 α（默认 0.5，仅 --emotion 时生效；时间占 1-α）")
     s.add_argument("--width", type=int, default=44); s.add_argument("--json", action="store_true")
 
     s = add("log", cmd_log, "时间轴列表（含权重与地址）")
