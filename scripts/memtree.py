@@ -634,6 +634,8 @@ def cmd_affect(conn, a):
     act = a.action
     if act == "set":
         nrow = node(conn, a.node)
+        if (nrow["zone"] or "hot") == "tombstone":
+            sys.exit("[memtree] 墓碑区节点已受理删除，不能再挂情感观察")
         if a.source == "roleplay" or (nrow["source_type"] or "stated") == "roleplay":
             sys.exit("[memtree] roleplay 内容不进入情感层（防虚构污染）")
         tags = normalize_affect_tags(a.tags)
@@ -1467,6 +1469,15 @@ def cmd_recall(conn, a):
         sys.exit("[memtree] --emotion 需要至少一个情感标签")
     emo_alpha = _range(getattr(a, "emotion_weight", 0.5), 0.0, 1.0, "--emotion-weight")
     amap = affect_map(conn) if qtags else {}
+    pipeline = getattr(a, "pipeline", "legacy")
+    expand_n = getattr(a, "expand", None)
+    if expand_n is None:
+        expand_n = max(a.top * 3, 20)
+    if expand_n < 1:
+        sys.exit("[memtree] --expand 必须 >= 1")
+    p_in = conn.execute("SELECT COUNT(*) c FROM nodes").fetchone()["c"]
+    p_valid = p_time = p_event = p_future = 0
+    p_rej_valid = p_time_pruned = p_event_pruned = 0
 
     want = {"active", "competing"} if a.status == "auto" else \
            {"active", "competing", "superseded", "archived"} if a.status == "any" else {a.status}
@@ -1507,15 +1518,26 @@ def cmd_recall(conn, a):
         # 都还没发生。只砍「真实未来」：--at 指向过去时，T 之后但已发生的条目仍要能检索
         # （结果维检索靠这个），否则回溯会把已经发生的事实一起藏起来。
         if at_mode and float(r["t"] or 0.0) > _now_e:
+            if pipeline == "v2":
+                p_future += 1
+            p_rej_valid += 1
+            continue
+        if pipeline == "v2" and not at_mode and float(r["t"] or 0.0) > _now_e:
+            # v2 把「真实未来」单列：它不占当前检索的 topN，也不装作已经发生。
+            p_future += 1
+            p_rej_valid += 1
             continue
         if at_mode and r["subject"]:
             # 现状类条目按「当时」判定：T 之后才发生的现状，在 T 那一刻还不存在
             if float(r["t"] or 0.0) > t_ref:
+                p_rej_valid += 1
                 continue
             is_cur = r["id"] in cur_ids
             if a.status == "auto" and not is_cur:
+                p_rej_valid += 1
                 continue
             if a.status == "superseded" and is_cur:
+                p_rej_valid += 1
                 continue
         elif at_mode and a.status == "auto":
             # 契约 H：无 subject 的条目（事件）没有「现状快照」可言，但它一样有
@@ -1527,24 +1549,34 @@ def cmd_recall(conn, a):
             if _g is not None and float(_g) <= t_ref:
                 if not _tomb:
                     n_ev_gone += 1      # 那一刻已失效，被藏起来 —— 必须说出来
+                p_rej_valid += 1
                 continue
             if not _tomb:
                 n_ev_active += 1
         elif r["status"] not in want:
+            p_rej_valid += 1
             continue
         if a.branch and not (r["branch"] == a.branch or r["scope"] == "global"):
-            continue
-        if a.event and (r["event"] or "") != a.event:   # 事件层过滤：先按事件剪枝，再算相似度
+            p_rej_valid += 1
             continue
         if a.zone and (r["zone"] or "hot") not in [z.strip() for z in a.zone.split(",")]:
+            p_rej_valid += 1
             continue
         # 墓碑区默认检索不到：已受理删除的记忆不该在「我以前说过什么」里冒出来
         if not a.zone and (r["zone"] or "hot") == "tombstone":
+            p_rej_valid += 1
             continue
-        # 不带主体的事件不参与现状判定，所以不硬性过滤"未来"：事后的结果也可能是当时的事证。
-        # 现状类（带 subject）的"当时状态"由上面的 cur_ids + gone_at 保证。
+        p_valid += 1
+        # 时间窗在事件过滤之前：先按 T 剪枝，再按事件标签剪枝，最后才算相似度。
+        # 不带主体的事件不参与现状判定，所以不硬性过滤"未来"；v2 已在上方单列未来。
         if a.days is not None and (t_ref - r["t"]) / 86400.0 > a.days:
+            p_time_pruned += 1
             continue
+        p_time += 1
+        if a.event and (r["event"] or "") != a.event:
+            p_event_pruned += 1
+            continue
+        p_event += 1
         st = time_weight(r["t"], t_ref)                  # t_q·t_m，t_q≡1
         so = r_ref * float(r["outcome"] or 0.0)          # r_q·r_m，r_q 默认 0 → 休眠
         se = dot(e_q, unpack_real(r["v_text"]))          # cos(e_q, e_m)
@@ -1560,15 +1592,61 @@ def cmd_recall(conn, a):
     # 用 Σ 当门槛会把一条 4 年前、但确确实实是当时现状的记忆静默滤掉（审计实证的
     # --at 空手就是这么来的）。所以 --at 下按语义重合判噪声，不按 Σ。
     hits = [h for h in hits if (h[2] if at_mode else h[0]) > 1e-9]
-    top = hits[: a.top]
-
     # 词面重合：随机投影词袋对"毫不相关"的两句话也会给出非零余弦，
     # 那不是命中而是噪声。重合为 0 的命中必须标注，否则模型会拿噪声当证据。
     qset = set(_terms(q_text))
+    pre_rd, pipe_info = {}, None
+    if pipeline == "v2":
+        # 事件级逐级展开：先把「事件」当检索单元（无事件则单条为单元），
+        # 只展开得分最高的前 N 个单元，再在成员内做混合相似度二次排序。
+        # 这样正文只加载被展开的成员，不会为了排序把整库正文都读一遍。
+        units = {}
+        for h in hits:
+            r = h[1]
+            key = ("ev", r["event"]) if r["event"] else ("node", r["id"])
+            units.setdefault(key, []).append(h)
+        ranked_units = sorted(units.items(), key=lambda kv: -max(x[0] for x in kv[1]))
+        chosen = ranked_units[:expand_n]
+        expanded = [h for _k, hs in chosen for h in hs]
+        for h in expanded:
+            r = h[1]
+            pre_rd[r["id"]] = readable(conn, r)
+        reranked = []
+        for s, r, se, st, so, emo in expanded:
+            body = pre_rd[r["id"]][0]
+            tset = set(_terms(body))
+            ov = (len(qset & tset) / float(len(qset))) if qset else 0.0
+            sim = 0.85 * se + 0.15 * ov
+            primary = ((1.0 - emo_alpha) * st + emo_alpha * emo) if qtags else st
+            s2 = sim * (primary + so) if a.mode == "and" else sim * (0.5 + 0.5 * primary) + 0.3 * so
+            reranked.append((s2, r, se, st, so, emo))
+        reranked.sort(key=lambda x: -x[0])
+        top = reranked[: a.top]
+        pipe_info = {
+            "mode": "v2",
+            "validity": {"in": p_in, "pruned": p_rej_valid,
+                         "out": p_in - p_rej_valid, "future_hidden": p_future},
+            "time_window": {"days": a.days, "in": p_valid,
+                            "pruned": p_time_pruned, "out": p_time,
+                            "anchor": "at" if at_mode else "now"},
+            "event_filter": {"event": a.event, "in": p_time,
+                             "pruned": p_event_pruned, "out": p_event},
+            "similarity": {"coarse": "vector_cos", "hybrid": "0.85*cos+0.15*lexical",
+                           "candidates": p_event, "kept": len(hits)},
+            "ranking": {"time": round(1.0 - emo_alpha if qtags else 1.0, 3),
+                        "emotion": round(emo_alpha if qtags else 0.0, 3),
+                        "outcome": 1.0},
+            "expand": {"units": len(units), "units_expanded": len(chosen),
+                       "members_scored": len(expanded), "bodies_loaded": len(pre_rd)},
+        }
+    else:
+        top = hits[: a.top]
+
     # 命中要给出的那段话（见 readable）：词面重合也用它算。
     # 正文已被抹掉、退到摘要的节点，若拿占位符去算重合，会误报
     # 「无词面重合·低置信」—— 那也是谎：明明有摘要可读。
-    rd = {row["id"]: readable(conn, row) for s, row, se, st, so, emo in top}
+    rd = {row["id"]: pre_rd.get(row["id"]) or readable(conn, row)
+          for s, row, se, st, so, emo in top}
 
     def _ov(row):
         tset = set(_terms(rd[row["id"]][0]))
@@ -1618,6 +1696,8 @@ def cmd_recall(conn, a):
         out = {"query": q_text, "t": a.at or now_iso(), "outcome": r_ref, "hits": hits_out}
         if qtags:
             out["emotion_query"] = {"tags": qtags, "alpha": emo_alpha}
+        if pipe_info:
+            out["pipeline"] = pipe_info
         if at_mode:
             out["as_of"] = a.at
             out["as_of_stats"] = {"active": n_at, "not_yet": n_not_yet,
@@ -1637,6 +1717,13 @@ def cmd_recall(conn, a):
         if at_mode and n_ev_gone > 0:
             print(f"（另有 {n_ev_gone} 条事件在那一刻已失效）")
 
+    if pipe_info:
+        q = pipe_info
+        print(f"[pipeline v2] 有效性 {q['validity']['in']}→{q['validity']['out']}"
+              f" 时间窗 {q['time_window']['in']}→{q['time_window']['out']}"
+              f" 事件 {q['event_filter']['in']}→{q['event_filter']['out']}"
+              f" 展开单元 {q['expand']['units_expanded']}/{q['expand']['units']}"
+              f" 未来隐藏 {q['validity']['future_hidden']}", file=sys.stderr)
     if not top:
         print("(无命中) —— 记忆库里没有语义相关的条目，不要据此编造。"
               "若确定记过，换关键词或放宽 --days / --status any 再试")
@@ -2288,6 +2375,10 @@ def main(argv=None):
     s.add_argument("--emotion", help="情绪相关性：查询标签（逗号分隔）；不填则情绪维休眠")
     s.add_argument("--emotion-weight", type=float, default=0.5,
                    help="情绪权重 α（默认 0.5，仅 --emotion 时生效；时间占 1-α）")
+    s.add_argument("--pipeline", choices=["legacy", "v2"], default="legacy",
+                   help="检索路径：legacy=现单遍打分（默认），v2=分层剪枝+事件展开")
+    s.add_argument("--expand", type=int,
+                   help="v2 最多展开多少个检索单元（默认 max(top*3,20)）")
     s.add_argument("--width", type=int, default=44); s.add_argument("--json", action="store_true")
 
     s = add("log", cmd_log, "时间轴列表（含权重与地址）")

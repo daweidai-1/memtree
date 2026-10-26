@@ -1157,5 +1157,38 @@ $M context --budget 500 >/dev/null 2>&1; MRC=$?
 chk "缺情感列的老库能直接打开" "'$MRC'=='0'"
 chk "老库 signals 情感列已由 _migrate 补回" "\"emotion_tags\" in [r[1] for r in c.execute(\"PRAGMA table_info(signals)\")] and \"valence\" in [r[1] for r in c.execute(\"PRAGMA table_info(signals)\")]"
 
+echo
+echo "[33] SPEC §8.3 分层检索 v2（剪枝 → 事件过滤 → 混合相似度 → 加权排序 → 逐级展开）"
+TF33=$(mktemp -d)
+export MEMTREE_DB="$(mktemp -d)/mt_selftest33.db"
+$M init >/dev/null
+T5OLD=$($M commit "项目 旧记录 A" --type event --event E1 --ts "2026-09-10T10:00:00+08:00" -q)
+T5NEW=$($M commit "项目 新记录 B" --type event --event E1 --ts "2026-10-24T10:00:00+08:00" -q)
+T5OTHER=$($M commit "项目 另一事件 C" --type event --event E2 --ts "2026-10-24T11:00:00+08:00" -q)
+T5RAW=$($M commit "项目 无事件 D" --type event --ts "2026-10-24T12:00:00+08:00" -q)
+T5FUT=$($M commit "项目 未来 E" --type event --event E3 --ts "2030-01-01T10:00:00+08:00" -q)
+$M recall "项目" --top 5 --json >"$TF33/legacy.json"
+ochk "默认 legacy 路径不出现 pipeline 对象（老契约不变）" "$TF33/legacy.json" "'pipeline' not in json.loads(out)"
+$M recall "项目" --pipeline v2 --top 5 --json >"$TF33/all.json"
+ochk "v2 输出完整 pipeline 审计对象" "$TF33/all.json" "all(k in json.loads(out)['pipeline'] for k in ('validity','time_window','event_filter','similarity','ranking','expand'))"
+ochk "未来条目不进当前 topN 且单独计数" "$TF33/all.json" "($T5FUT not in [h['id'] for h in json.loads(out)['hits']]) and json.loads(out)['pipeline']['validity']['future_hidden']==1"
+ochk "有效性门：in = pruned + out（不静默丢条）" "$TF33/all.json" "(lambda v: v['in']==v['pruned']+v['out'])(json.loads(out)['pipeline']['validity'])"
+$M recall "项目" --pipeline v2 --days 10 --top 5 --json >"$TF33/time.json"
+ochk "时间窗剪枝：40 天旧条目被剪掉并报数" "$TF33/time.json" "(lambda p: p['time_window']['pruned']==1 and $T5OLD not in [h['id'] for h in json.loads(out)['hits']])(json.loads(out)['pipeline'])"
+ochk "时间窗：in = pruned + out" "$TF33/time.json" "(lambda p: p['in']==p['pruned']+p['out'])(json.loads(out)['pipeline']['time_window'])"
+ochk "时间窗锚点标明 now" "$TF33/time.json" "json.loads(out)['pipeline']['time_window']['anchor']=='now'"
+$M recall "项目" --pipeline v2 --event E1 --top 5 --json >"$TF33/event.json"
+ochk "事件过滤在相似度前剪枝，并报剪掉条数" "$TF33/event.json" "(lambda e: e['event']=='E1' and e['pruned']==2 and e['out']==2)(json.loads(out)['pipeline']['event_filter'])"
+ochk "事件过滤后只剩 E1 成员" "$TF33/event.json" "set(h['id'] for h in json.loads(out)['hits'])=={$T5OLD,$T5NEW}"
+ochk "混合相似度阶段有 coarse/hybrid 口径" "$TF33/event.json" "json.loads(out)['pipeline']['similarity']['coarse']=='vector_cos' and 'lexical' in json.loads(out)['pipeline']['similarity']['hybrid']"
+$M recall "项目" --pipeline v2 --event E1 --top 1 --expand 1 --json >"$TF33/expand.json"
+ochk "逐级展开：E1 作为一个事件单元展开，成员都参与重排" "$TF33/expand.json" "(lambda e: e['units']==1 and e['units_expanded']==1 and e['members_scored']==2 and len(json.loads(out)['hits'])==1)(json.loads(out)['pipeline']['expand'])"
+ochk "展开阶段记录正文加载数（不静默全库读正文）" "$TF33/expand.json" "json.loads(out)['pipeline']['expand']['bodies_loaded']==2"
+$M recall "项目" --pipeline v2 --at 2026-09-20 --days 12 --top 5 --json >"$TF33/at.json"
+ochk "--at 下时间窗锚定 T，旧条目在 T 视角窗口内仍命中" "$TF33/at.json" "json.loads(out)['pipeline']['time_window']['anchor']=='at' and $T5OLD in [h['id'] for h in json.loads(out)['hits']]"
+ochk "--at 下 not_yet/already_gone 统计仍给全" "$TF33/at.json" "all(k in json.loads(out)['as_of_stats'] for k in ('not_yet','already_gone','unknown_timing'))"
+EX0=$($M recall "项目" --pipeline v2 --expand 0 2>&1); EXRC=$?
+chk "--expand 0 当场拒绝（避免假装展开）" "'$EXRC'!='0'"
+
 echo "通过 $PASS / 失败 $FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
