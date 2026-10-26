@@ -391,6 +391,16 @@ def live_refs(conn, addr):
                         (addr,)).fetchone()["c"]
 
 
+def pinned_refs(conn, addr):
+    """该地址上打了保护位的节点数 —— 墓碑区里的也算。
+
+    墓碑 A(pinned) 与墓碑 B(unpinned) 共用同一 addr 时，B 到期不能抹掉
+    A 的保护位想保住的那串正文：保护位在墓碑里同样必须有效。
+    """
+    return conn.execute("SELECT COUNT(*) c FROM nodes WHERE addr=? AND pinned=1",
+                        (addr,)).fetchone()["c"]
+
+
 def emit(conn, obj, quiet=False):
     if not quiet:
         print(json.dumps(obj, ensure_ascii=False))
@@ -1086,7 +1096,9 @@ def cmd_purge(conn, a):
                if (now_e - (r["tombstoned_at"] or now_e)) / 86400.0 >= PURGE_COOLDOWN_DAYS]
         n = skipped_pinned = skipped_shared = 0
         for r in due:
-            if r["pinned"]:                 # 保护位在冷却期满后依然挡删
+            # 保护位在冷却期满后依然挡删；同一地址上任何一条（含墓碑区里的）打保护位
+            # 都挡住这个 blob —— 计进 skipped_pinned，不重复计进 skipped_shared。
+            if pinned_refs(conn, r["addr"]) > 0:
                 skipped_pinned += 1
                 continue
             if live_refs(conn, r["addr"]) > 0:   # 共用地址还有活引用 → 抹了就是删别人的数据
@@ -1122,11 +1134,14 @@ def cmd_purge(conn, a):
     for r in rows:
         conn.execute("UPDATE nodes SET zone='tombstone', tombstoned_at=?, purge_reason=? WHERE id=?",
                      (now_e, a.reason, r["id"]))
-    n = n_shared = 0
-    if a.now:   # 隐私/错误信息：跳过冷却，立刻生效（跳过冷却 ≠ 跳过引用计数）
+    n = n_pinned = n_shared = 0
+    if a.now:   # 隐私/错误信息：跳过冷却，立刻生效（跳过冷却 ≠ 跳过引用计数/保护位）
         # 每条地址只判一次：同一批里多条共用同一地址时，判定不能依赖遍历顺序
         # （先走到的那条会看到「后面那条还活着」，报出 skipped 却照样被抹）。
         for addr in {r["addr"] for r in rows}:
+            if pinned_refs(conn, addr) > 0:      # 同一地址上有保护位（含墓碑区）→ 不抹
+                n_pinned += 1
+                continue
             if live_refs(conn, addr) > 0:
                 n_shared += 1
                 continue
@@ -1134,10 +1149,11 @@ def cmd_purge(conn, a):
                               (addr,)).rowcount
     conn.commit()
     if a.now:
-        emit(conn, {"purged_now": n, "skipped_shared": n_shared, "reason": a.reason,
+        emit(conn, {"purged_now": n, "skipped_pinned": n_pinned,
+                    "skipped_shared": n_shared, "reason": a.reason,
                     "cooldown_skipped": True,
                     "note": "立即删除：隐私/错误信息不需要冷却，删除不可恢复；"
-                            "仍被活引用的地址不抹正文"})
+                            "保护位/仍被引用的地址不抹正文"})
         return
     emit(conn, {"tombstoned": len(rows), "cooldown_days": PURGE_COOLDOWN_DAYS,
                 "due_at": datetime.fromtimestamp(now_e + PURGE_COOLDOWN_DAYS * 86400).strftime("%Y-%m-%d"),
