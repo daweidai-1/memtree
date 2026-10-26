@@ -837,5 +837,66 @@ $M recall "搬到南京" --at 2025-08-01 >"$TF28/subj_0801.txt"
 ochk "H⑥：覆盖发生后（--at 2025-08-01）现状换成南京" "$TF28/subj_0801.txt" "'新状态：搬到南京' in out"
 ochk "H⑥：单条 hit 不加事件新键（events_active/events_gone 只在 as_of_stats 里）" "$TF28/e1_before.json" "not ({'events_active','events_gone'} & set(json.loads(out)['hits'][0].keys()))"
 
+echo "[29] 契约 I：--at 下无 subject 条目（事件）不打现状标记（当时现状/当时已过时/不可当现状）"
+TF29=$(mktemp -d)
+export MEMTREE_DB="$(mktemp -d)/mt_selftest21.db"
+$M init >/dev/null
+# 无 subject 的事件：#E1 一直有效；#E2 在 2026-06-01 失效（归档）
+E1=$($M commit "年会定在三月" --type event --event 年会 --ts 2026-01-10 -q | tail -1)
+E2=$($M commit "团建排在十月" --type event --event 团建 --ts 2026-02-01 -q | tail -1)
+# 带 subject 的现状：#F1 被 #F2 覆盖 → 反向断言现状标记没被一起删干净
+F1=$($M commit "旧状态：住在杭州" --type fact --subject loc29 --ts 2025-01-01 -q | tail -1)
+F2=$($M commit "新状态：搬到南京" --type fact --subject loc29 --ts 2025-06-01 -q | tail -1)
+GONE_E=$("$PY" -c 'import datetime;print(datetime.datetime(2026,6,1).timestamp())')
+"$PY" - "$MEMTREE_DB" "$E2" "$GONE_E" <<'EOF'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+c.execute("update nodes set status='archived', zone='archive', gone_at=? where id=?",
+          (float(sys.argv[3]), int(sys.argv[2])))
+c.commit()
+EOF
+chk "I 前置：#$E1 是 active 的无 subject 事件、#$E2 已失效（archived+gone_at）、#$F1 已被覆盖（superseded）" "c.execute(\"select status from nodes where id=$E1\").fetchone()[0]=='active' and c.execute(\"select subject from nodes where id=$E1\").fetchone()[0] is None and c.execute(\"select gone_at from nodes where id=$E2\").fetchone()[0] is not None and c.execute(\"select status from nodes where id=$F1\").fetchone()[0]=='superseded'"
+
+# ---- 事件行在 --at 下：正文/事件名留着，现状标记一个字都不许有 ----
+$M recall "年会定在三月" --at 2026-03-01 >"$TF29/ev_at.txt"
+ochk "I①：--at 下事件行照样读得到正文（别把整行裁没了）" "$TF29/ev_at.txt" "'年会定在三月' in out"
+ochk "I①：--at 下事件行不打「当时已过时」（它没有现状可过时）" "$TF29/ev_at.txt" "'当时已过时' not in out"
+ochk "I①：--at 下事件行也不打「当时现状」" "$TF29/ev_at.txt" "'当时现状' not in out"
+ochk "I①：--at 下事件行不带非回溯模式的「·不可当现状」后缀" "$TF29/ev_at.txt" "'不可当现状' not in out"
+ochk "I①：事件行的 ⟦事件名⟧ 后缀仍在（标记去掉、信息不许少）" "$TF29/ev_at.txt" "'⟦年会⟧' in out"
+
+# ---- 反向断言：带 subject 的现状标记不许被一起删干净 ----
+$M recall "住在杭州" --at 2025-03-01 >"$TF29/sub_0301.txt"
+ochk "I②：带 subject 且当时仍是现状 → 逐字「当时现状」仍在" "$TF29/sub_0301.txt" "'「当时现状」' in out and '旧状态：住在杭州' in out"
+$M recall "住在杭州" --at 2025-08-01 --status any >"$TF29/sub_0801.txt"
+ochk "I②：带 subject 且当时已被覆盖（--status any 才看得见旧行）→ 逐字「当时已过时」仍在" "$TF29/sub_0801.txt" "'「当时已过时」' in out and '「当时现状」' in out"
+
+# ---- 不带 --at：事件行的状态后缀行为逐字不变 ----
+$M recall "团建排在十月" --status any >"$TF29/ev_plain.txt"
+ochk "I③：不带 --at 时事件行仍按当前 status 打「archived·不可当现状」，且不出现任何「当时…」标记" "$TF29/ev_plain.txt" "'「archived·不可当现状」' in out and '当时已过时' not in out and '当时现状' not in out"
+
+# ---- JSON 结构不变：--at 与不带 --at 的 hit 键集合必须完全相同 ----
+$M recall "年会定在三月" --json >"$TF29/ev_plain.json"
+$M recall "年会定在三月" --at 2026-03-01 --json >"$TF29/ev_at.json"
+KEYCMP=$("$PY" - "$TF29/ev_plain.json" "$TF29/ev_at.json" <<'EOF'
+import json, sys
+a = json.load(open(sys.argv[1], encoding="utf-8"))["hits"]
+b = json.load(open(sys.argv[2], encoding="utf-8"))["hits"]
+print(1 if a and b and sorted(a[0].keys()) == sorted(b[0].keys()) else 0)
+EOF
+)
+chk "I④：--at 的 hit 键集合与不带 --at 完全相同（JSON 输出不变，不许偷偷加现状标记键）" "'$KEYCMP'=='1'"
+ochk "I④：--at 的 hit 键集合钉死这 20 个键（往后加任何键都会红）" "$TF29/ev_at.json" "sorted(json.loads(out)['hits'][0].keys())==['addr','cold','content','content_cleared','content_kind','event','id','low_confidence','out','overlap','score','sem','status','status_now','subject','summarized_into','summary_of','time','ts','zone']"
+ochk "I④：契约 H 不回退 —— --at 的 as_of_stats 仍给 events_active/events_gone 且都是 int" "$TF29/ev_at.json" "(lambda s: ('events_active' in s) and ('events_gone' in s) and type(s['events_active']) is int and type(s['events_gone']) is int)(json.loads(out)['as_of_stats'])"
+
+# ---- 契约 H⑤ 与契约 I 不冲突：被 gone_at 藏掉时仍逐字报数 ----
+$M recall "团建排在十月" --at 2026-08-01 >"$TF29/ev_gone.txt"
+ochk "I⑤：事件被 gone_at 隐藏时提示行仍逐字出现，且该行不许被塞进现状标记" "$TF29/ev_gone.txt" "'（另有 1 条事件在那一刻已失效）' in out and '当时已过时' not in out"
+
+# ---- 低置信（Σ=0 噪声）分支与 --at 同时使用 ----
+$M recall "聚餐" --at 2026-03-01 >"$TF29/ev_lowconf.txt"
+ochk "I⑥：--at 下低置信分支里的事件行同样一个字现状标记都没有（带 ⟦事件名⟧ 的行才判，非事件行照旧有标记）" "$TF29/ev_lowconf.txt" "(lambda ls: bool(ls) and not any(('当时已过时' in l) or ('当时现状' in l) or ('不可当现状' in l) for l in ls))([l for l in out.splitlines() if '⟦' in l])"
+ochk "I⑥：这一跑确实落进了低置信分支，且带 subject 的行仍保留「当时现状」（对照，防止整库标记被删）" "$TF29/ev_lowconf.txt" "'(低置信)' in out and '「当时现状」' in out"
+
 echo "通过 $PASS / 失败 $FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
