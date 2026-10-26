@@ -35,6 +35,7 @@ import re
 import sqlite3
 import struct
 import sys
+import tempfile
 import unicodedata
 from datetime import datetime, timedelta
 
@@ -56,6 +57,14 @@ PURGE_COOLDOWN_DAYS = 7.0           # 墓碑区冷却期：删除不可逆，缓
 HOT_DAYS, WARM_DAYS = 7.0, 90.0     # 热 ≤7 天；温 7~90 天；更旧则看重要度：冷（保护区）或归档
 COLD_MIN_IMPORTANCE = 0.7           # 进冷区（保护区）的重要度下限：冷区不是垃圾桶
 DEFAULT_DB = os.path.join(".workbuddy", "memory", "memtree.db")
+# 人格卡（SPEC §6）：三层锚点预算。卡文件只说"现在是什么"，persona_log 说"改过什么"。
+# 硬槽是"我是谁"的护栏 —— 改它必须 --force：人格漂移和记忆覆盖不同，它不会自己回滚。
+PERSONA_SLOTS = ("hard", "soft", "var")
+PERSONA_TITLES = {"hard": "## 硬槽", "soft": "## 软槽", "var": "## 可变槽"}
+PERSONA_TITLE_TO_SLOT = {v: k for k, v in PERSONA_TITLES.items()}
+PERSONA_LABELS = {"hard": "硬", "soft": "软", "var": "可变"}
+PERSONA_SLOT_BUDGET = {"hard": 300, "soft": 350, "var": 150}
+PERSONA_TOTAL_BUDGET = 800
 
 
 # ------------------------------------------------------------------ 记忆的数学形式
@@ -288,6 +297,18 @@ def _schema(conn):
             at          TEXT NOT NULL
         );
 
+        -- 人格卡审计（SPEC §6）：卡文件只说"现在是什么"，这张表是"改过什么"的唯一真源。
+        -- --at 回溯、超预算挤出、防人格漂移都只能靠它回答。
+        CREATE TABLE IF NOT EXISTS persona_log(
+            id     INTEGER PRIMARY KEY AUTOINCREMENT,
+            t      REAL NOT NULL,
+            slot   TEXT NOT NULL,
+            op     TEXT NOT NULL,          -- add|del|evict
+            old    TEXT,
+            new    TEXT,
+            reason TEXT
+        );
+
         CREATE TABLE IF NOT EXISTS branches(
             name TEXT PRIMARY KEY, fork_node INTEGER, head_id INTEGER,
             status TEXT NOT NULL DEFAULT 'open', merged_into TEXT, merged_at TEXT, created_at TEXT
@@ -502,6 +523,203 @@ def weight(node_row, now_epoch=None):
     """
     now_epoch = now_epoch or datetime.now().timestamp()
     return 0.5 ** (abs(now_epoch - node_row["t"]) / 86400.0 / TAU_DAYS)
+
+
+# ------------------------------------------------------------------ 人格卡（SPEC §6）
+def persona_path(args):
+    """卡文件默认躺在库旁边（memtree.db.persona.md）：记忆和人格同生共死，别指望它们分头备份。"""
+    p = getattr(args, "persona_file", None) or (db_path(args) + ".persona.md")
+    return os.path.abspath(p)
+
+
+def persona_load(args):
+    """读卡。空槽保留标题、未知标题与空行一律忽略：手改坏一行不许把整张卡读崩。"""
+    slots = {k: [] for k in PERSONA_SLOTS}
+    try:
+        with open(persona_path(args), "r", encoding="utf-8") as f:
+            raw = f.read()
+    except FileNotFoundError:
+        return slots
+    cur = None
+    for line in raw.splitlines():
+        s = line.strip()
+        if s in PERSONA_TITLE_TO_SLOT:
+            cur = PERSONA_TITLE_TO_SLOT[s]
+            continue
+        if s.startswith("##"):
+            cur = None                  # 未知段：其下内容不属于任何槽，宁可丢掉也不许乱归
+            continue
+        if cur and s.startswith("- "):
+            v = s[2:].strip()
+            if v and v not in slots[cur]:
+                slots[cur].append(v)
+    return slots
+
+
+def persona_text(slots):
+    out = []
+    for k in PERSONA_SLOTS:
+        out.append(PERSONA_TITLES[k])
+        out += [f"- {x}" for x in slots[k]]
+    return "\n".join(out) + "\n"
+
+
+def persona_tokens(slots):
+    # 空卡算 0：三段标题是格式，不是人格内容 —— 空卡不该在预算里占 14 token。
+    return est_tokens(persona_text(slots)) if any(slots[k] for k in PERSONA_SLOTS) else 0
+
+
+def persona_slot_tokens(entries):
+    return est_tokens("\n".join(f"- {x}" for x in entries)) if entries else 0
+
+
+def persona_save(args, slots):
+    """原子写：同目录临时文件 + os.replace。半张卡比旧卡更糟 —— 人格没有回滚。"""
+    path = persona_path(args)
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d or ".", prefix=".persona-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            f.write(persona_text(slots))
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+def persona_log(conn, slot, op, old=None, new=None, reason=None, t=None):
+    conn.execute(
+        "INSERT INTO persona_log(t,slot,op,old,new,reason) VALUES(?,?,?,?,?,?)",
+        (t if t is not None else datetime.now().timestamp(), slot, op, old, new, reason))
+
+
+def persona_last_write(conn):
+    """(slot, 条目) → (最后写入时刻, log id)。挤出次序只按这个，不按卡文件行序。"""
+    last = {}
+    for r in conn.execute("SELECT id,t,slot,new FROM persona_log WHERE op='add' AND new IS NOT NULL"):
+        last[(r["slot"], r["new"])] = (float(r["t"]), r["id"])
+    return last
+
+
+def persona_replay(conn, t_ref):
+    """--at：从空卡正向重放 t<=T 的记录。历史卡只能这样重建 —— 卡文件里只有"现在"。"""
+    slots = {k: [] for k in PERSONA_SLOTS}
+    for r in conn.execute("SELECT * FROM persona_log WHERE t<=? ORDER BY t, id", (t_ref,)):
+        s = r["slot"]
+        if s not in slots:
+            continue
+        if r["op"] == "add":
+            if r["new"] and r["new"] not in slots[s]:
+                slots[s].append(r["new"])
+        elif r["old"] in slots[s]:       # del / evict：从那一刻起不在卡上
+            slots[s].remove(r["old"])
+    return slots
+
+
+def cmd_persona(conn, a):
+    act = a.action
+    slots = persona_load(a)
+
+    if act == "show":
+        if a.at:
+            slots = persona_replay(conn, parse_ts(a.at).timestamp())
+        empty = not any(slots[k] for k in PERSONA_SLOTS)
+        if a.json:
+            tok = persona_slot_tokens(slots["hard"]), persona_slot_tokens(slots["soft"]), persona_slot_tokens(slots["var"])
+            obj = {"slots": {k: list(slots[k]) for k in PERSONA_SLOTS},
+                   "est_tokens": persona_tokens(slots),
+                   "total_budget": PERSONA_TOTAL_BUDGET,
+                   "slot_budgets": dict(PERSONA_SLOT_BUDGET),
+                   "path": persona_path(a)}
+            if a.at:
+                obj["as_of"] = now_iso(parse_ts(a.at).astimezone())
+            emit(conn, obj)
+        else:
+            print("(卡为空)" if empty else persona_text(slots).rstrip("\n"))
+        return
+
+    if act == "set":
+        text = " ".join((a.text or "").split())      # 卡格式是一行一条：正文里的换行压成空格
+        if not text:
+            print("[memtree] 人格条目不能为空", file=sys.stderr)
+            sys.exit(2)
+        slot = a.slot
+        if text in slots[slot]:                      # 幂等：不写文件、不写日志
+            emit(conn, {"changed": False, "note": "已存在，未改动"})
+            return
+        if slot == "hard" and not a.force:
+            print("[memtree] 硬槽改动需要 --force（防人格漂移）", file=sys.stderr)
+            sys.exit(2)
+        t_now = datetime.now().timestamp()
+        last = persona_last_write(conn)
+        cand = {k: list(slots[k]) for k in PERSONA_SLOTS}
+        cand[slot].append(text)
+        evicted = []
+        # 硬槽不许挤：它是人格护栏，超了就是这次写入错了，不是别人的位置该让开。
+        while slot != "hard" and persona_slot_tokens(cand[slot]) > PERSONA_SLOT_BUDGET[slot]:
+            others = [x for x in cand[slot] if x != text]
+            if not others:
+                break
+            others.sort(key=lambda x: last.get((slot, x), (0.0, 0)))
+            victim = others[0]                       # 最旧优先（同刻按 log id 升序）
+            cand[slot].remove(victim)
+            evicted.append(victim)
+        if persona_slot_tokens(cand[slot]) > PERSONA_SLOT_BUDGET[slot]:
+            print(f"[memtree] 槽预算超限：需要 {persona_slot_tokens(cand[slot])} token，"
+                  f"上限 {PERSONA_SLOT_BUDGET[slot]}", file=sys.stderr)
+            sys.exit(2)
+        tok = {k: persona_slot_tokens(cand[k]) for k in PERSONA_SLOTS}
+        total = persona_tokens(cand)
+        if total > PERSONA_TOTAL_BUDGET:             # 三槽各有预算，整卡还有一条总闸
+            print(f"[memtree] 总预算超限：需要 {total} token，上限 {PERSONA_TOTAL_BUDGET}"
+                  f"（硬 {tok['hard']} / 软 {tok['soft']} / 可变 {tok['var']}）", file=sys.stderr)
+            sys.exit(2)
+        persona_save(a, cand)                        # 先落卡文件，再记日志：卡是"现在"，日志是"改过什么"
+        for v in evicted:
+            persona_log(conn, slot, "evict", v, None, a.reason or "超预算挤出", t_now)
+        persona_log(conn, slot, "add", None, text, a.reason, t_now)
+        conn.commit()
+        emit(conn, {"changed": True, "slot": slot, "slot_tokens": tok[slot],
+                    "total_tokens": total, "evicted": evicted})
+        return
+
+    if act == "drop":
+        text = " ".join((a.text or "").split())
+        slot = a.slot
+        if text not in slots[slot]:
+            emit(conn, {"changed": False, "note": "不存在，未改动"})
+            return
+        cand = {k: list(slots[k]) for k in PERSONA_SLOTS}
+        cand[slot] = [x for x in slots[slot] if x != text]
+        persona_save(a, cand)
+        persona_log(conn, slot, "del", text, None, a.reason)
+        conn.commit()
+        emit(conn, {"changed": True, "slot": slot, "dropped": text,
+                    "slot_tokens": persona_slot_tokens(cand[slot]),
+                    "total_tokens": persona_tokens(cand), "evicted": []})
+        return
+
+    if act == "log":
+        rows = conn.execute("SELECT * FROM persona_log ORDER BY t DESC, id DESC LIMIT ?",
+                            (a.limit,)).fetchall()
+        if a.json:
+            emit(conn, [{"id": r["id"], "t": now_iso(datetime.fromtimestamp(r["t"]).astimezone()),
+                         "slot": r["slot"], "op": r["op"], "old": r["old"],
+                         "new": r["new"], "reason": r["reason"]} for r in rows])
+        else:
+            for r in rows:
+                arrow = f"{r['old'] or '-'}→{r['new'] or '-'}"
+                print(f"{r['id']:>4} {now_iso(datetime.fromtimestamp(r['t']).astimezone())} "
+                      f"{r['slot']:<4} {r['op']:<5} {arrow}  {r['reason'] or ''}")
+            if not rows:
+                print("(无人格改动记录)")
+        return
+
+    print(f"[memtree] 未知 persona 动作：{act}", file=sys.stderr)
+    sys.exit(2)
 
 
 # ------------------------------------------------------------------ 写入
@@ -959,8 +1177,15 @@ def cmd_context(conn, a):
                  f"| {n_all}节点·废{n_cold}】")
     n_fact_all, n_ev_all = len(facts), len(events)
 
+    # 人格卡（SPEC §6）：整卡为空时一行都不出（输出与没有人格卡时逐字相同）。
+    # 它排在锚点之前、加进 rebuild，因此自然计入 --budget，但永不被裁剪：
+    # 人格不许因为这一次预算紧张而消失 —— "我是谁"不是可裁的上下文。
+    _pslots = persona_load(a)
+    persona_lines = [f"⚓人格·{PERSONA_LABELS[k]} " + "；".join(_pslots[k])
+                     for k in PERSONA_SLOTS if _pslots[k]]
+
     def rebuild():
-        return [head_line] + anchors + facts + evl + branches + events + legend.split("\n")
+        return [head_line] + persona_lines + anchors + facts + evl + branches + events + legend.split("\n")
 
     def size():
         return sum(len(x) + 1 for x in rebuild())
@@ -1004,6 +1229,9 @@ def cmd_context(conn, a):
         emit(conn, {"text": out, "chars": len(out), "est_tokens": est_tokens(out),
                     "shown": {"anchors": len(anchors), "facts": len(facts), "events": len(events)},
                     "total": {"facts": n_fact_all, "events": n_ev_all, "future": n_future},
+                    "persona": {"hard": list(_pslots["hard"]), "soft": list(_pslots["soft"]),
+                                "var": list(_pslots["var"]),
+                                "est_tokens": persona_tokens(_pslots)},
                     "dropped": dropped})
     else:
         print(out)
@@ -1780,6 +2008,7 @@ def main(argv=None):
     s.add_argument("--branch"); s.add_argument("--budget", type=int, default=650)
     s.add_argument("--recent", type=int, default=3); s.add_argument("--width", type=int, default=40)
     s.add_argument("--json", action="store_true"); s.add_argument("--verbose", "-v", action="store_true")
+    s.add_argument("--persona-file", help="人格卡路径（默认 <db>.persona.md）")
 
     s = add("recall", cmd_recall, "三维检索（时间×结果×语义）")
     s.add_argument("query")
@@ -1838,6 +2067,35 @@ def main(argv=None):
     s.add_argument("--heat", type=float,
                    help="热度门（0~1）：只压缩热度低于该值的候选；不填则只按时间裁")
     s.add_argument("--branch", help="默认跟随当前 HEAD（原实现写死 main，exp 分支的旧事件永远压不到）")
+
+    s = add("persona", cmd_persona, "人格卡：硬/软/可变三槽（改硬槽要 --force，超预算按最旧挤出）")
+    pa = s.add_subparsers(dest="action", required=True)
+
+    def padd(name, h):
+        ps = pa.add_parser(name, help=h)
+        # --db 与 --persona-file 在这里也认一遍：子命令后面跟 --db 才是人的手顺，
+        # argparse 只在属性不存在时套默认值，所以与全局 --db 并存不会互相覆盖。
+        # default=SUPPRESS 是关键：写成默认 None 会把"全局 --db"覆盖成 None
+        # （实测：memtree --db X.db persona show 的卡路径会掉回 DEFAULT_DB）。
+        ps.add_argument("--db", default=argparse.SUPPRESS)
+        ps.add_argument("--persona-file", default=argparse.SUPPRESS,
+                        help="卡文件路径（默认 <db>.persona.md）")
+        ps.set_defaults(fn=cmd_persona)
+        return ps
+
+    ps = padd("show", "看当前卡正文；--at 看某个时刻的卡")
+    ps.add_argument("--json", action="store_true"); ps.add_argument("--at")
+
+    ps = padd("set", "加一条（硬槽需 --force；超预算按最旧挤出）")
+    ps.add_argument("text"); ps.add_argument("--slot", required=True, choices=list(PERSONA_SLOTS))
+    ps.add_argument("--force", action="store_true"); ps.add_argument("--reason")
+
+    ps = padd("drop", "删一条")
+    ps.add_argument("text"); ps.add_argument("--slot", required=True, choices=list(PERSONA_SLOTS))
+    ps.add_argument("--reason")
+
+    ps = padd("log", "人格改动审计（时间倒序）")
+    ps.add_argument("--limit", type=int, default=20); ps.add_argument("--json", action="store_true")
 
     s = add("stats", cmd_stats, "统计")
     s = add("export", cmd_export, "导出 JSON")
