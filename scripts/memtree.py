@@ -1758,15 +1758,29 @@ def cmd_compress(conn, a):
     再想问「当时为什么这么定」就只能靠悬空地址。现在按事件分组：
     同事件内最新 keep_detail 条细节保留原文，更老的压成一行，结论永远不动。
     """
-    cut = parse_ts(a.before).timestamp() if a.before else datetime.now().timestamp() - a.days * 86400
+    t_now = datetime.now().timestamp()
+    # 显式 --before/--days 沿用旧的单一截止时刻；未显式给定时才按类型分档。
+    explicit_cut = (parse_ts(a.before).timestamp() if a.before
+                    else t_now - a.days * 86400 if a.days is not None else None)
+
+    def automatic_cut(r):
+        # 情感锚点永不自动压缩；重要记忆 90 天，普通记忆 30 天。
+        if r["label"] == "emotional" or r["type"] == "anchor":
+            return None
+        important = float(r["importance"] if r["importance"] is not None else 0.5) >= 0.7 or r["pinned"]
+        return t_now - (90 if important else 30) * 86400
+
     br = a.branch or head_branch(conn)
     keep = set()
     for b in conn.execute("SELECT fork_node, head_id FROM branches"):
         keep.update(x for x in (b["fork_node"], b["head_id"]) if x)
     # pinned 走不到这层压缩：保护位永远只做 1~2 级压缩，不自动归档（SPEC §5.4）
-    t_now = datetime.now().timestamp()
-    rows = [r for r in _rows(conn)
-            if r["status"] == "active" and r["t"] < cut
+    rows = []
+    for r in _rows(conn):
+        cut = explicit_cut if explicit_cut is not None else automatic_cut(r)
+        if cut is None or r["t"] >= cut:
+            continue
+        if (r["status"] == "active"
             # 候选=事件本身，或带事件标签的条目：压缩必须在事件内部做，
             # 跨事件糊成一条就丢掉了「哪个结论属于哪件事」这层结构
             and (r["type"] == "event" or r["event"]) and r["type"] != "summary"
@@ -1780,7 +1794,8 @@ def cmd_compress(conn, a):
             # 未来条目按 min(t, now) 算是"刚写上去"，热度恒 1.0 —— 但"还没发生"不是
             # 豁免压缩的理由（审计实证：一条 2030 的事件永久免疫）。它和 noise 一样走快车道。
             and (a.heat is None or r["label"] == "noise" or float(r["t"] or 0.0) > t_now
-                 or heat_of(r, t_now) <= a.heat)]
+                 or heat_of(r, t_now) <= a.heat)):
+            rows.append(r)
     concl = [r for r in rows if is_conclusion(r)]
     detail = [r for r in rows if not is_conclusion(r)]
 
@@ -2065,7 +2080,8 @@ def main(argv=None):
     s.add_argument("--all", action="store_true")
 
     s = add("compress", cmd_compress, "事件内细节梯度压缩：越新越细，结论必留")
-    s.add_argument("--before"); s.add_argument("--days", type=int, default=30)
+    s.add_argument("--before"); s.add_argument("--days", type=int, default=None,
+                   help="显式统一时间窗（覆盖默认分档：普通 30 天 / 重要 90 天 / 情感锚点永不自动压缩）")
     s.add_argument("--min-count", type=int, default=3); s.add_argument("--text")
     s.add_argument("--keep-detail", type=int, default=1,
                    help="同一事件内保留原文细节的条数（最新 N 条），更老的压成一行摘要")

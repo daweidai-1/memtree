@@ -1048,5 +1048,54 @@ $M persona drop "根本没有这条硬槽条目" --slot hard >"$TF30/drop_hard_n
 chk "J11d：drop 硬槽不存在的条目且无 --force → 退出码 0（幂等判定排在 --force 之前）" "'$DHNC'=='0'"
 ochk "J11d：同一条 → changed 为 false，且不报「需要 --force」" "$TF30/drop_hard_no.txt" "('force' not in out) and (('false' in out) or ('未改动' in out))"
 
+echo
+echo "[31] SPEC §4.2 分类型压缩阈值（普通 30 天 / 重要 90 天 / 情感锚点永不自动压缩）"
+TF31=$(mktemp -d)
+export MEMTREE_DB="$(mktemp -d)/mt_selftest31.db"
+$M init >/dev/null
+TS31=$("$PY" -c 'from datetime import datetime,timedelta; print((datetime.now().astimezone()-timedelta(days=31)).isoformat())')
+TS91=$("$PY" -c 'from datetime import datetime,timedelta; print((datetime.now().astimezone()-timedelta(days=91)).isoformat())')
+TS1000=$("$PY" -c 'from datetime import datetime,timedelta; print((datetime.now().astimezone()-timedelta(days=1000)).isoformat())')
+N31=$($M commit "普通细节 31 天" --type event --event T31_NORMAL --ts "$TS31" -q)
+I31=$($M commit "重要细节 31 天" --type event --event T31_IMPORTANT --importance 0.8 --ts "$TS31" -q)
+I91=$($M commit "重要细节 91 天" --type event --event T91_IMPORTANT --importance 0.8 --ts "$TS91" -q)
+E31=$($M commit "情感锚点 31 天" --type event --event T31_EMOTION --ts "$TS31" -q)
+E1000=$($M commit "情感锚点 1000 天" --type event --event T1000_EMOTION --ts "$TS1000" -q)
+A1000=$($M commit "硬锚点 1000 天" --type anchor --event T1000_ANCHOR --ts "$TS1000" -q)
+# 清掉 label CLI 会附带的 pinned，并强制留在 hot：断言必须真的穿过情感/锚点守卫，
+# 不能靠保护位或 archive 过滤假通过。
+"$PY" - "$MEMTREE_DB" "$E31" "$E1000" "$A1000" <<'EOF'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+for node_id in map(int, sys.argv[2:4]):
+    c.execute("update nodes set label='emotional', pinned=0, zone='hot' where id=?", (node_id,))
+c.execute("update nodes set pinned=0, zone='hot' where id=?", (int(sys.argv[4]),))
+c.commit()
+EOF
+$M commit "当前进展：移动 HEAD" --type event -q >/dev/null
+$M compress --min-count 1 --keep-detail 0 >"$TF31/default.json"
+chk "普通条目 31 天进入候选并被压缩" "c.execute(\"select status from nodes where id=$N31\").fetchone()[0]=='archived'"
+chk "重要条目 31 天不进入候选" "c.execute(\"select status from nodes where id=$I31\").fetchone()[0]=='active'"
+chk "重要条目 91 天进入候选并被压缩" "c.execute(\"select status from nodes where id=$I91\").fetchone()[0]=='archived'"
+chk "label=emotional 在 31 天不进入候选" "c.execute(\"select status from nodes where id=$E31\").fetchone()[0]=='active'"
+chk "label=emotional 在 1000 天也不进入候选" "c.execute(\"select status from nodes where id=$E1000\").fetchone()[0]=='active'"
+chk "type=anchor 在 1000 天也不进入候选" "c.execute(\"select status from nodes where id=$A1000\").fetchone()[0]=='active'"
+ochk "默认分档只压普通 31 天和重要 91 天两条" "$TF31/default.json" "json.loads(out)['compressed']==2"
+IO31=$($M commit "重要细节 31 天：显式 days 覆盖" --type event --event T31_OVERRIDE --importance 0.8 --ts "$TS31" -q)
+$M commit "当前进展：再次移动 HEAD" --type event -q >/dev/null
+$M compress --days 30 --min-count 1 --keep-detail 0 >"$TF31/override.json"
+chk "显式 --days 仍按参数统一 cutoff：重要 31 天也进入候选" "c.execute(\"select status from nodes where id=$IO31\").fetchone()[0]=='archived'"
+chk "显式 --days 不绕过情感/锚点结论保护" "c.execute(\"select count(*) from nodes where id in ($E31,$E1000,$A1000) and status='active'\").fetchone()[0]==3"
+# 本批不改 schema；仍从缺 importance 的老库进入 compress，验证迁移后新分档路径可直接打开。
+"$PY" - "$MEMTREE_DB" <<'EOF'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+c.execute("ALTER TABLE nodes DROP COLUMN importance")
+c.commit()
+EOF
+$M compress --min-count 1 --keep-detail 0 >"$TF31/legacy.json" 2>&1; LRC=$?
+chk "缺 importance 的老库能直接打开并走完 compress" "'$LRC'=='0'"
+chk "老库 importance 列已由 _migrate 补回" "\"importance\" in [r[1] for r in c.execute(\"PRAGMA table_info(nodes)\")]"
+
 echo "通过 $PASS / 失败 $FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
