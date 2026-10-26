@@ -144,14 +144,14 @@ DB 默认 `./.workbuddy/memory/memtree.db`，用 `MEMTREE_DB` 覆盖（按项目
 
 ### 5.2 安装态是第二份副本（必须同步）
 
-技能实际加载的位置是 **`C:/Users/荣贤达/.workbuddy/skills/memory-timeline`**（整棵树副本，自带 `.git`）。
+技能实际加载的位置是 **`$HOME/.workbuddy/skills/memory-timeline`**（整棵树副本，自带 `.git`）。
 仓库改了不同步 = Agent 读旧文档、跑旧代码。**这是最容易忘的一步。**
 
 **六件文档**（一个循环覆盖）：
 
 ```bash
-cd "C:/Users/荣贤达/OneDrive/Desktop/memory-timeline"
-D="C:/Users/荣贤达/.workbuddy/skills/memory-timeline"
+cd "$(git rev-parse --show-toplevel)"
+D="$HOME/.workbuddy/skills/memory-timeline"
 for f in SKILL.md README.md AUDIT.md references/schema.md references/theory.md references/prompts.md; do
   cp "$f" "$D/$f"
 done
@@ -160,8 +160,8 @@ done
 **但代码也要覆盖**，否则 skill 跑的是旧实现：
 
 ```bash
-cd "C:/Users/荣贤达/OneDrive/Desktop/memory-timeline"
-D="C:/Users/荣贤达/.workbuddy/skills/memory-timeline"
+cd "$(git rev-parse --show-toplevel)"
+D="$HOME/.workbuddy/skills/memory-timeline"
 cp scripts/memtree.py scripts/selftest.sh "$D/scripts/"
 cp bin/memtree bin/memtree.cmd "$D/bin/"
 diff -rq . "$D" 2>/dev/null | grep -v '\.git'   # 期望：无输出
@@ -172,7 +172,7 @@ diff -rq . "$D" 2>/dev/null | grep -v '\.git'   # 期望：无输出
 
 ### 5.3 自检怎么跑（本机必须先给解释器）
 
-本机 MSYS2 bash 的 PATH 里，用户名段是乱码（`/c/Users/���ʹ�/...`），所以 `command -v python` 全部 MISSING，直接跑会报：
+某些 MSYS2 bash 环境的 PATH 里用户名段可能乱码，导致 `command -v python` 全部 MISSING，直接跑会报：
 
 ```
 找不到 python，请设 MEMTREE_PY
@@ -181,11 +181,11 @@ diff -rq . "$D" 2>/dev/null | grep -v '\.git'   # 期望：无输出
 正确姿势：
 
 ```bash
-cd "C:/Users/荣贤达/OneDrive/Desktop/memory-timeline"
-MEMTREE_PY="/c/Users/荣贤达/AppData/Local/Programs/Python/Python312/python.exe" PYTHONIOENCODING=utf-8 bash scripts/selftest.sh
+cd "$(git rev-parse --show-toplevel)"
+PYTHONIOENCODING=utf-8 bash scripts/selftest.sh
 ```
 
-（实测 Python 3.12.8。最后一行应打印 `通过 337 / 失败 0`，共 33 组；命令前还需要 `PYTHONIOENCODING=utf-8`。）
+最后一行应打印 `通过 366 / 失败 0`，共 34 组。若 `python/python3` 不在 PATH，设 `MEMTREE_PY` 指向解释器（Windows 下填 `python.exe` 的路径即可）。
 
 ---
 
@@ -199,7 +199,7 @@ MEMTREE_PY="/c/Users/荣贤达/AppData/Local/Programs/Python/Python312/python.ex
 **怎么提交**（不改全局 git config、不 push）：
 
 ```bash
-cd "C:/Users/荣贤达/OneDrive/Desktop/memory-timeline"
+cd "$(git rev-parse --show-toplevel)"
 git -c user.name=xiaobai -c user.email=xiaobai@localhost commit -m "..."
 ```
 
@@ -215,8 +215,8 @@ git -c user.name=xiaobai -c user.email=xiaobai@localhost commit -m "..."
 2. **图例 parity**：`SKILL.md` 的图例行必须与 `memtree.py` 的 `legend` 常量**逐字**一致（历史上专为它做过校验）。注意：**自检只验图例「存在」**（`grep "禁止当作现状"`），**不验 parity** —— 改完自己跑：
 
 ```bash
-cd "C:/Users/荣贤达/OneDrive/Desktop/memory-timeline"
-PY="/c/Users/荣贤达/AppData/Local/Programs/Python/Python312/python.exe"
+cd "$(git rev-parse --show-toplevel)"
+PY="${MEMTREE_PY:-python}"
 "$PY" - <<'EOF'
 import ast, pathlib
 src = pathlib.Path("scripts/memtree.py").read_text(encoding="utf-8")
