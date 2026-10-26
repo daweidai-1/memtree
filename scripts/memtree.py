@@ -438,6 +438,13 @@ def _migrate(conn):
             conn.execute("UPDATE nodes SET zone=? WHERE id=?",
                          (zone_target(age, r["importance"], r["pinned"], r["label"]), r["id"]))
         conn.commit()
+    # 老版本 --apply 只清正文、不结案，留下 zone='tombstone' + hot=2 的幽灵。
+    # 升级时一次性转 purged 终态：正文已经不可恢复，继续留在墓碑队列只会
+    # 让 --list 永远 due、--restore 谎报可撤回。
+    conn.execute("""UPDATE nodes SET zone='purged', tombstoned_at=NULL
+                      WHERE zone='tombstone' AND EXISTS(
+                        SELECT 1 FROM blobs b WHERE b.addr=nodes.addr AND b.hot=2)""")
+    conn.commit()
 
 
 def get_branch(conn, name):
@@ -1947,11 +1954,15 @@ def cmd_purge(conn, a):
             # 隐私级联：节点行保留作悬空地址，但情绪标签/原话必须一起消失，
             # 否则 purge 只删了正文、情感观察还留在 affect 表里。
             conn.execute("DELETE FROM affect WHERE node_id=?", (r["id"],))
+            # 真删成功后离开墓碑区，进入 purged 终态。否则 --list 永远 due、
+            # 再 --apply 永远 purged:0，墓碑列表成了不会结案的队列。
+            conn.execute("UPDATE nodes SET zone='purged', tombstoned_at=NULL WHERE id=?",
+                         (r["id"],))
         conn.commit()
         waiting = conn.execute("SELECT COUNT(*) c FROM nodes WHERE zone='tombstone'").fetchone()["c"]
         emit(conn, {"purged": n, "due": len(due), "skipped_pinned": skipped_pinned,
-                    "skipped_shared": skipped_shared, "still_waiting": waiting - len(due),
-                    "note": "冷却期满才真删：正文清除，只留悬空地址；"
+                    "skipped_shared": skipped_shared, "still_waiting": waiting,
+                    "note": "冷却期满才真删：正文清除并转 purged 终态；"
                             "保护位/仍被引用的地址不抹正文"})
         return
 

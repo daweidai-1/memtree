@@ -1243,6 +1243,38 @@ $M purge --list >"$TF34/f2_list.json"
 ochk "F2：真删后墓碑列表为 0" "$TF34/f2_list.json" "json.loads(out)['tombstones']==0"
 $M purge --now --reason 隐私 >"$TF34/f2_empty.json"
 ochk "F2：无墓碑时 note 明确说『没有墓碑节点』" "$TF34/f2_empty.json" "json.loads(out)['purged_existing']==0 and '没有墓碑节点' in json.loads(out)['note']"
+# F4：--apply 真删后必须结案，不许永远赖在墓碑列表。
+F4N=$($M commit "F4 待真删" --type fact --subject f4.gone -q)
+F4ADDR=$("$PY" - "$MEMTREE_DB" "$F4N" <<'EOF'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+print(c.execute("select addr from nodes where id=?", (int(sys.argv[2]),)).fetchone()[0])
+EOF
+)
+$M purge --addr "$F4ADDR" --reason 常规清理 >/dev/null
+"$PY" - "$MEMTREE_DB" "$F4N" <<'EOF'
+import sqlite3, sys, time
+c = sqlite3.connect(sys.argv[1])
+c.execute("update nodes set tombstoned_at=? where id=?", (time.time() - 8 * 86400, int(sys.argv[2])))
+c.commit()
+EOF
+$M purge --apply >"$TF34/f4_apply.json"
+chk "F4：apply 后节点转 purged 终态" "c.execute(\"select zone from nodes where id=$F4N\").fetchone()[0]=='purged'"
+chk "F4：apply 后正文已清且机器地址保留" "c.execute(\"select hot,content from blobs where addr='$F4ADDR'\").fetchone()[:2]==(2,'')"
+$M purge --list >"$TF34/f4_list.json"
+ochk "F4：apply 后墓碑列表必须为 0" "$TF34/f4_list.json" "json.loads(out)['tombstones']==0"
+$M purge --apply >"$TF34/f4_again.json"
+ochk "F4：再 apply 返回 purged=0, due=0" "$TF34/f4_again.json" "json.loads(out)['purged']==0 and json.loads(out)['due']==0"
+$M recall "F4 待真删" --status any --json >"$TF34/f4_recall.json"
+ochk "F4：purged 节点 recall 不再命中" "$TF34/f4_recall.json" "$F4N not in [h['id'] for h in json.loads(out)['hits']]"
+"$PY" - "$MEMTREE_DB" "$F4N" <<'EOF'
+import sqlite3, sys, time
+c = sqlite3.connect(sys.argv[1])
+c.execute("update nodes set zone='tombstone', tombstoned_at=? where id=?", (time.time(), int(sys.argv[2])))
+c.commit()
+EOF
+$M context --budget 500 >/dev/null 2>&1
+chk "F4：老库 tombstone+hot=2 幽灵由 _migrate 平滑转为 purged" "c.execute(\"select zone from nodes where id=$F4N\").fetchone()[0]=='purged'"
 
 echo "通过 $PASS / 失败 $FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
