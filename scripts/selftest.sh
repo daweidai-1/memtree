@@ -1018,5 +1018,34 @@ ochk "J7：--budget 极小时人格卡行不被裁（现成裁剪只动 facts/ev
 $M context --budget 3000 --json >"$TF30/ctx_full.json"
 ochk "J7：context --json 带 persona 三槽与 est_tokens" "$TF30/ctx_full.json" "(lambda p: ('persona' in p) and len(p['persona']['hard'])>=1 and isinstance(p['persona']['est_tokens'], int) and p['persona']['est_tokens']>0)(json.loads(out))"
 
+# ---- J11：drop 硬槽同样要 --force（且幂等判定必须排在 --force 判定之前）----
+# 放在 J7 之后：J11b 会把硬槽那一条真删掉，而前面的 J6/J7 都还要用它。
+sha_of() { "$PY" -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$1"; }
+log_count() { "$PY" - "$MEMTREE_DB" <<'PYEOF'
+import sqlite3, sys
+print(sqlite3.connect(sys.argv[1]).execute("select count(*) from persona_log").fetchone()[0])
+PYEOF
+}
+SHA11_BEF=$(sha_of "$PF")
+LOG11_BEF=$(log_count)
+$M persona drop "称呼用户为老大" --slot hard >"$TF30/drop_hard_reject.txt" 2>&1; DRHC=$?
+chk "J11a：drop 硬槽不带 --force 必须拒绝（非 0 退出）" "'$DRHC'!='0'"
+ochk "J11a：拒绝时说清硬槽改动要 --force" "$TF30/drop_hard_reject.txt" "('force' in out) and ('硬槽' in out)"
+chk "J11a：拒绝时卡文件 sha256 不变（不许删掉半条）" "'$(sha_of "$PF")'=='$SHA11_BEF'"
+chk "J11a：拒绝时 persona_log 行数不变（不许留 del 痕）" "'$(log_count)'=='$LOG11_BEF'"
+HAS_H11=$(card_has "称呼用户为老大"); HAS_H11="${HAS_H11:-0}"
+chk "J11a：拒绝时条目仍留在卡里" "'$HAS_H11'!='0'"
+$M persona drop "称呼用户为老大" --slot hard --force >"$TF30/drop_hard_ok.txt" 2>&1; DRHC2=$?
+chk "J11b：同一个 drop 带 --force 才成功（退出码 0）" "'$DRHC2'=='0'"
+HAS_H12=$(card_has "称呼用户为老大"); HAS_H12="${HAS_H12:-0}"
+chk "J11b：带 --force 的 drop 之后卡里该条消失" "'$HAS_H12'=='0'"
+chk "J11b：drop 必须留痕 —— persona_log 里有 hard 的 del 记录" "c.execute(\"select count(*) from persona_log where slot='hard' and op='del'\").fetchone()[0]>=1"
+$M persona drop "根本没有这条软槽条目" --slot soft >"$TF30/drop_soft_no.txt" 2>&1; DSNC=$?
+chk "J11c：drop 软槽不存在的条目 → 退出码 0（幂等优先，不因缺 --force 报错）" "'$DSNC'=='0'"
+ochk "J11c：drop 软槽不存在的条目 → changed 为 false" "$TF30/drop_soft_no.txt" "('false' in out) or ('未改动' in out)"
+$M persona drop "根本没有这条硬槽条目" --slot hard >"$TF30/drop_hard_no.txt" 2>&1; DHNC=$?
+chk "J11d：drop 硬槽不存在的条目且无 --force → 退出码 0（幂等判定排在 --force 之前）" "'$DHNC'=='0'"
+ochk "J11d：同一条 → changed 为 false，且不报「需要 --force」" "$TF30/drop_hard_no.txt" "('force' not in out) and (('false' in out) or ('未改动' in out))"
+
 echo "通过 $PASS / 失败 $FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
