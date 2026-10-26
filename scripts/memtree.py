@@ -397,6 +397,48 @@ def content_of(conn, addr, hot_only=False):
     return r["content"]
 
 
+def readable(conn, r):
+    """检索命中时要给出的正文：库里还有这句话，就不许只回一个占位符。
+
+    content_of(hot_only=True) 是「预取视图」（context/log 的省 token 口径），
+    冷区就回占位；但检索是「我记过什么」的回答，占位等于半空手 —— 命中给了
+    分数和地址却读不到话，是比没命中更坏的结果（会诱导模型自己编）。
+
+    返回 (正文, 说明)。说明只描述「这是什么」，由输出层如实标注：
+    - kind: '原文' / '摘要' / '占位'
+    - cold: 正文在冷库(hot=0)，仍在库里，只是没被预取
+    - summary_of: 这行本身是摘要，它概括的原文节点号（不许假装是原文）
+    - summarized_into: 这行是被压掉的细节，它的摘要节点号
+    - cleared: 正文真的被 purge 抹掉了（不可恢复）
+    """
+    info = {"kind": "原文", "cold": False}
+    b = conn.execute("SELECT * FROM blobs WHERE addr=?", (r["addr"],)).fetchone()
+    text = b["content"] if b else None
+    if r["type"] == "summary":
+        # 摘要正文是「压 N 条」的一句话：必须自报家门，否则会被当成原话引用
+        info["kind"] = "摘要"
+        try:
+            info["summary_of"] = json.loads(r["meta"] or "{}").get("ids") or []
+        except Exception:
+            info["summary_of"] = []
+    if text:
+        info["cold"] = bool(b["hot"] != 1)
+        if r["rolled_into"]:
+            info["summarized_into"] = r["rolled_into"]
+        return text, info
+    # 正文确实被抹了：退到摘要，并明说这是摘要不是原文
+    if r["rolled_into"]:
+        s = conn.execute("SELECT * FROM nodes WHERE id=?", (r["rolled_into"],)).fetchone()
+        sb = (conn.execute("SELECT * FROM blobs WHERE addr=?", (s["addr"],)).fetchone()
+              if s else None)
+        if sb and sb["content"]:
+            info.update({"kind": "摘要", "cold": bool(sb["hot"] != 1),
+                         "summarized_into": s["id"], "cleared": True})
+            return sb["content"], info
+    info.update({"kind": "占位", "cleared": True})
+    return f"[地址 {r['addr']} 正文已清除]", info
+
+
 def live_refs(conn, addr):
     """地址的「活引用」数：除墓碑区以外任何 zone 的节点都算。
 
@@ -1067,9 +1109,13 @@ def cmd_recall(conn, a):
     # 词面重合：随机投影词袋对"毫不相关"的两句话也会给出非零余弦，
     # 那不是命中而是噪声。重合为 0 的命中必须标注，否则模型会拿噪声当证据。
     qset = set(_terms(q_text))
+    # 命中要给出的那段话（见 readable）：词面重合也用它算。
+    # 正文已被抹掉、退到摘要的节点，若拿占位符去算重合，会误报
+    # 「无词面重合·低置信」—— 那也是谎：明明有摘要可读。
+    rd = {row["id"]: readable(conn, row) for s, row, se, st, so in top}
 
     def _ov(row):
-        tset = set(_terms(content_of(conn, row["addr"], False)))
+        tset = set(_terms(rd[row["id"]][0]))
         return (len(qset & tset) / float(len(qset))) if qset else 0.0
 
     ovmap = {row["id"]: _ov(row) for s, row, se, st, so in top}
@@ -1081,20 +1127,31 @@ def cmd_recall(conn, a):
                          [(datetime.now().timestamp(), h[1]["id"]) for h in top])
         conn.commit()
     if a.json:
-        out = {"query": q_text, "t": a.at or now_iso(), "outcome": r_ref, "hits": [
-            {"id": r["id"], "score": round(s, 3), "sem": round(se, 2), "time": round(st, 2),
-             "out": round(so, 2),
-             # --at 视角下报「当时」的 status：当时还是现状就是 active，
-             # 当前 status 另放 status_now —— 两者并列才看得出覆盖发生在什么时候。
-             "status": ("active" if at_mode and r["id"] in cur_ids else r["status"]),
-             "status_now": r["status"],
-             "subject": r["subject"], "event": r["event"], "zone": r["zone"], "addr": r["addr"],
-             "overlap": round(ovmap[r["id"]], 2),
-             "low_confidence": ovmap[r["id"]] == 0.0,
-             # 回溯时正文必须读得到：被覆盖的条目 blob 已转冷(hot=0)，
-             # 但"当初是什么"正是要回答的问题，不是可以藏起来的冷数据。
-             "content": content_of(conn, r["addr"], not at_mode),
-             "ts": r["ts_iso"]} for s, r, se, st, so in top]}
+        hits_out = []
+        for s, r, se, st, so in top:
+            body, how = rd[r["id"]]
+            hits_out.append({
+                "id": r["id"], "score": round(s, 3), "sem": round(se, 2), "time": round(st, 2),
+                "out": round(so, 2),
+                # --at 视角下报「当时」的 status：当时还是现状就是 active，
+                # 当前 status 另放 status_now —— 两者并列才看得出覆盖发生在什么时候。
+                "status": ("active" if at_mode and r["id"] in cur_ids else r["status"]),
+                "status_now": r["status"],
+                "subject": r["subject"], "event": r["event"], "zone": r["zone"],
+                "addr": r["addr"],
+                "overlap": round(ovmap[r["id"]], 2),
+                "low_confidence": ovmap[r["id"]] == 0.0,
+                # 命中必须能读回正文（G1）：冷库(hot=0)也直接解引用 —— 正文还在库里，
+                # 「明明记过却检索不出来」是本项目最不该发生的事。
+                # kind 说明给的是原文还是摘要/占位，摘要必带原文节点号（不许假装是原文）。
+                "content": body,
+                "content_kind": how["kind"],
+                "cold": how["cold"],
+                "summary_of": how.get("summary_of"),
+                "summarized_into": how.get("summarized_into"),
+                "content_cleared": bool(how.get("cleared")),
+                "ts": r["ts_iso"]})
+        out = {"query": q_text, "t": a.at or now_iso(), "outcome": r_ref, "hits": hits_out}
         if at_mode:
             out["as_of"] = a.at
             out["as_of_stats"] = {"active": n_at, "not_yet": n_not_yet,
@@ -1119,9 +1176,20 @@ def cmd_recall(conn, a):
         else:
             flag = "" if r["status"] == "active" else f"「{r['status']}·不可当现状」"
             glyph = GLYPH.get(r["status"], "?")
+        body, how = rd[r["id"]]
+        # 给的是摘要/占位/冷区都必须当场说出来（本项目原则：隐藏必须说出来）
+        if how["kind"] == "摘要":
+            ids = ",".join(f"#{i}" for i in (how.get("summary_of") or []))
+            tag = f" ⟪摘要·原文{ids}⟫" if ids else " ⟪摘要⟫"
+        elif how["kind"] == "占位":
+            tag = " ⟪正文已清除·不可回溯⟫"
+        elif how["cold"]:
+            tag = " ❄冷·正文照读"
+        else:
+            tag = ""
         print(f"{bar(s)} #{r['id']:<3} {glyph} {short_date(r['t'])} "
               f"t·{st:.2f} r·{so:+.2f} sem{se:+.2f} Σ={s:+.3f} → "
-              f"{clip(content_of(conn, r['addr'], hot_only=not at_mode), a.width)}"
+              f"{clip(body, a.width)}{tag}"
               f"{' ⟦' + r['event'] + '⟧' if r['event'] else ''}"
               f"{' 「无词面重合·低置信」' if ovmap[r['id']] == 0.0 else ''} {flag}")
 
@@ -1482,8 +1550,12 @@ def cmd_compress(conn, a):
             (to_zip[0]["t"], evl or to_zip[0]["subject"], addr, pack_real(text_vec(body)),
              f"压:{span}/{len(to_zip)}条", br, to_zip[0]["parent_id"],
              json.dumps({"rolled": len(to_zip), "ids": [r["id"] for r in to_zip],
-                         "event": evl, "kept_detail": sorted(kept_ids) if keep_n else []}),
-             now_iso(), evl))
+                         "event": evl, "span": span, "compressed_at": now_iso(),
+                         "kept_detail": sorted(kept_ids) if keep_n else []}),
+             # ts_iso 必须是它代表的事件时间（区间最老那条），不是生成时刻：
+             # 「2024 年那段对话的摘要」显示成今天，就是让时间轴说谎。
+             # 生成时刻要留，留在 meta.compressed_at 里。
+             now_iso(datetime.fromtimestamp(to_zip[0]["t"]).astimezone()), evl))
         sid = cur.lastrowid
         for r in to_zip:
             conn.execute("""UPDATE nodes SET status='archived', rolled_into=?, gone_at=?
