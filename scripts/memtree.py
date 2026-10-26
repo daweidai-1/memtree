@@ -379,6 +379,18 @@ def content_of(conn, addr, hot_only=False):
     return r["content"]
 
 
+def live_refs(conn, addr):
+    """地址的「活引用」数：除墓碑区以外任何 zone 的节点都算。
+
+    含 status='archived'/'superseded' —— 转冷、被压掉的正文也还要能回溯，
+    所以它们照样保护 blob。内容寻址会去重：两条不同来源、正文一字不差的
+    节点共用同一 addr，抹掉就是删别人的数据，不可恢复。
+    """
+    return conn.execute("SELECT COUNT(*) c FROM nodes WHERE addr=?"
+                        " AND (zone IS NULL OR zone<>'tombstone')",
+                        (addr,)).fetchone()["c"]
+
+
 def emit(conn, obj, quiet=False):
     if not quiet:
         print(json.dumps(obj, ensure_ascii=False))
@@ -497,7 +509,10 @@ def cmd_commit(conn, a):
 
 def cmd_pin(conn, a):
     """保护位：不压缩、不硬删、不裁剪（§5.4 保护位机制）。"""
-    node(conn, a.id)
+    r = node(conn, a.id)
+    if (r["zone"] or "hot") == "tombstone":
+        sys.exit(f"[memtree] #{a.id} 在墓碑区：墓碑区节点没有保护位可用，"
+                 f"请先 purge --restore {a.id}")
     conn.execute("UPDATE nodes SET pinned=? WHERE id=?", (0 if a.off else 1, a.id))
     conn.commit()
     emit(conn, {"id": a.id, "pinned": 0 if a.off else 1})
@@ -1066,17 +1081,25 @@ def cmd_purge(conn, a):
                     "note": "冷却期内 purge --restore <id> 可撤回；到期由 purge --apply 真删"})
         return
     if a.apply:
-        due = [r for r in conn.execute("SELECT id,addr,tombstoned_at FROM nodes"
+        due = [r for r in conn.execute("SELECT id,addr,pinned,tombstoned_at FROM nodes"
                                        " WHERE zone='tombstone'").fetchall()
                if (now_e - (r["tombstoned_at"] or now_e)) / 86400.0 >= PURGE_COOLDOWN_DAYS]
-        n = 0
+        n = skipped_pinned = skipped_shared = 0
         for r in due:
+            if r["pinned"]:                 # 保护位在冷却期满后依然挡删
+                skipped_pinned += 1
+                continue
+            if live_refs(conn, r["addr"]) > 0:   # 共用地址还有活引用 → 抹了就是删别人的数据
+                skipped_shared += 1
+                continue
             n += conn.execute("UPDATE blobs SET hot=2, content='' WHERE addr=? AND hot!=2",
                               (r["addr"],)).rowcount
         conn.commit()
         waiting = conn.execute("SELECT COUNT(*) c FROM nodes WHERE zone='tombstone'").fetchone()["c"]
-        emit(conn, {"purged": n, "due": len(due), "still_waiting": waiting - len(due),
-                    "note": "冷却期满才真删：正文清除，只留悬空地址"})
+        emit(conn, {"purged": n, "due": len(due), "skipped_pinned": skipped_pinned,
+                    "skipped_shared": skipped_shared, "still_waiting": waiting - len(due),
+                    "note": "冷却期满才真删：正文清除，只留悬空地址；"
+                            "保护位/仍被引用的地址不抹正文"})
         return
 
     # 进墓碑区：--addr 指定一条；否则整批（已覆盖/归档、无保护位、非锚点）
@@ -1096,17 +1119,25 @@ def cmd_purge(conn, a):
     if not rows:
         emit(conn, {"tombstoned": 0, "note": "没有可删的候选"})
         return
-    n = 0
     for r in rows:
         conn.execute("UPDATE nodes SET zone='tombstone', tombstoned_at=?, purge_reason=? WHERE id=?",
                      (now_e, a.reason, r["id"]))
-        if a.now:   # 隐私/错误信息：跳过冷却，立刻生效
+    n = n_shared = 0
+    if a.now:   # 隐私/错误信息：跳过冷却，立刻生效（跳过冷却 ≠ 跳过引用计数）
+        # 每条地址只判一次：同一批里多条共用同一地址时，判定不能依赖遍历顺序
+        # （先走到的那条会看到「后面那条还活着」，报出 skipped 却照样被抹）。
+        for addr in {r["addr"] for r in rows}:
+            if live_refs(conn, addr) > 0:
+                n_shared += 1
+                continue
             n += conn.execute("UPDATE blobs SET hot=2, content='' WHERE addr=? AND hot!=2",
-                              (r["addr"],)).rowcount
+                              (addr,)).rowcount
     conn.commit()
     if a.now:
-        emit(conn, {"purged_now": n, "reason": a.reason, "cooldown_skipped": True,
-                    "note": "立即删除：隐私/错误信息不需要冷却，删除不可恢复"})
+        emit(conn, {"purged_now": n, "skipped_shared": n_shared, "reason": a.reason,
+                    "cooldown_skipped": True,
+                    "note": "立即删除：隐私/错误信息不需要冷却，删除不可恢复；"
+                            "仍被活引用的地址不抹正文"})
         return
     emit(conn, {"tombstoned": len(rows), "cooldown_days": PURGE_COOLDOWN_DAYS,
                 "due_at": datetime.fromtimestamp(now_e + PURGE_COOLDOWN_DAYS * 86400).strftime("%Y-%m-%d"),
