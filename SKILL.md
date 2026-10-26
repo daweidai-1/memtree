@@ -152,5 +152,5 @@ memtree label <id> anchor|emotional|noise|clear    # 手动打标
 
 DB 默认 `./.workbuddy/memory/memtree.db`，用 `MEMTREE_DB` 覆盖（按项目分库）。
 
-自检 337 项（33 组）：`bash scripts/selftest.sh`。
+自检 366 项（34 组）：`bash scripts/selftest.sh`。
 数学推导见 `references/theory.md`；表结构与状态机见 `references/schema.md`。

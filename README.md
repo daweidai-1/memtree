@@ -5,7 +5,7 @@
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Deps](https://img.shields.io/badge/dependencies-0-brightgreen)]()
-[![Self-test](https://img.shields.io/badge/self--test-337%2F337-success)]()
+[![Self-test](https://img.shields.io/badge/self--test-366%2F366-success)]()
 
 > A timeline-first memory layer for AI agents. Old state is superseded by time, not by an LLM vote. 530 bytes per memory, ~360 tokens per turn, zero dependencies.
 
@@ -232,9 +232,9 @@ $M graph --style git              # 输出 Mermaid 图
 
 ### 删除是两段式，保护位在墓碑里也有效
 
-- **第一段只进墓碑区**：`purge` 把候选改成 `zone='tombstone'` + `tombstoned_at` + `purge_reason` —— 正文还在库里，但立刻从 `recall` 与 `context` 消失。冷却 `7` 天，`purge --apply` 期满才抹正文；`--restore <id>` 冷却期内撤回（正文从未删除，分区按时间重算）；`--now` 给隐私/错误开直通车（跳过冷却，但**不跳过**下面的引用计数与保护位）。
+- **第一段只进墓碑区**：`purge` 把候选改成 `zone='tombstone'` + `tombstoned_at` + `purge_reason` —— 正文还在库里，但立刻从 `recall` 与 `context` 消失。冷却 `7` 天，`purge --apply` 期满才抹正文并把节点转 `purged` 终态；`--restore <id>` 只有正文完好时能撤回（正文已永久删除则拒绝）；`--now` 给隐私/错误开直通车，覆盖**所有**墓碑节点（含本轮之前就在墓碑区的），返回 `purged_now` 与 `purged_existing` 两个计数。
 - **三条硬拦**（`--apply` 与 `--now` 都要过）：①保护位 —— 同一地址上**任何一条**钉住就不抹，**墓碑区里的 `pinned` 也算**；②共享地址 —— 该地址上还有任何 `zone <> 'tombstone'` 的节点（active / superseded / archived 全算）就不抹，因为正文一字不差的两条记忆共用一个 `addr`，抹一条等于烧掉另一条；③墓碑里不许 `pin` —— 否则「先钉再删」能造出假保护位。
-- **计数归属**：同一地址既命中保护位又有活引用时**只计 `skipped_pinned`**，不重复计 `skipped_shared`。被跳过的条目仍留在墓碑区，下次 `--apply` 继续重试。
+- **计数归属**：同一地址既命中保护位又有活引用时**只计 `skipped_pinned`**，不重复计 `skipped_shared`。被跳过的条目仍留在墓碑区，下次 `--apply` 继续重试。真删成功的节点转 `purged`，不会再出现在 `purge --list`，也不会被 `--restore` 复活。
 - **孤儿正文**（全库没有任何节点引用）由 `purge --gc` 显式回收：只删 `blobs` 行、不删 `nodes` 行；墓碑节点仍算引用者，所以冷却期内不可能被当孤儿误删。`--dry-run` 先报能省多少。
 
 ### 回溯问的是当时，不是现在
@@ -257,13 +257,13 @@ $M graph --style git              # 输出 Mermaid 图
 - `affect` 是**独立表**：一条记忆可以有多条情感观察，保存 `tags / intensity / valence / key_quote / source`；`nodes.label='emotional'` 只回答“是不是情感锚点”，不再承担完整情绪语义。
 - 固定词表 8 类 + `unspecified`：`joy / trust / surprise / sadness / fear / anger / disgust / anticipation`；CLI 接受常见中文别名。未知标签直接拒绝，不静默丢弃。
 - `signal <id> --type emotional_peak --tags 喜悦,信任 --intensity 0.9 --valence 0.8 --quote "…"` → `settle` 聚合成 `affect`。`roleplay` 内容永不进入情感层。
-- 检索用 `recall "…" --emotion 喜悦` 才激活情绪维：`S = sim × ((1-α)·时间 + α·情绪 + 结果项)`，默认 α=0.5；不带 `--emotion` 时输出与旧版逐键相同，情绪维完全休眠。
+- 检索用 `recall "…" --emotion 喜悦` 才激活情绪维：`S = sim × ((1-α)·时间 + α·情绪 + 结果项)`，默认 α=0.5；查询标签在候选集零命中时自动退回 α=0，并在 `emotion.alpha_applied` 与 stderr 说明，绝不把全库分数腰斩。
 - 情绪**只影响这次查询的排序**，不影响 status、分区、保护位、压缩或保留时长 —— 不违反“被问得多 ≠ 值得记住”。
 - `purge --apply/--now` 会级联删除该节点的 `affect` 行，避免正文删了、标签和原话还留在库里。
 
 ### 分层检索 v2（灰度）
 
-`recall --pipeline v2` 才启用，默认 `legacy` 不变：`有效性门 → 时间窗剪枝 → 事件过滤 → 混合相似度 → 加权排序 → 事件级逐级展开`。每级都在 `pipeline` 对象里报 `in / pruned / out`，未来条目单列 `future_hidden`，`--at` 的时间窗锚定 T 而不是现在。展开阶段只给前 N 个检索单元加载正文，不为了排序把整库正文读一遍。
+`recall --pipeline v2` 才启用，默认 `legacy` 不变：`有效性门 → 时间窗剪枝 → 事件过滤 → 混合相似度 → 加权排序 → 事件级逐级展开`。每级都在 `pipeline` 对象里报 `in / pruned / out`，未来条目单列 `future_hidden`，`--at` 的时间窗锚定 T 而不是现在。展开阶段只给前 N 个检索单元加载正文，不为了排序把整库正文读一遍；被 `--expand` 截掉的单元与条数会报 `units_skipped / members_dropped` 并给 warning。
 
 ### 命令速查
 
@@ -308,7 +308,7 @@ DB 默认 `./.workbuddy/memory/memtree.db`，用 `MEMTREE_DB` 覆盖（按项目
 bash scripts/selftest.sh
 ```
 
-337 项（33 组），覆盖：时间覆盖 / 乱序补录 / 三维检索 / 内容寻址 / 分支 / context 预算 / 压缩 / 压缩梯度（`--keep-detail` 与结论必留）/ 物理清除 / 出图 / 参数校验 / 未来时间戳 / 保护位 / 硬锚点 / 非 ASCII 向量 / 热度计时器 / 事件层 / 五档分区 / 墓碑两段式 / 删除路径加固（保护位·共享地址·墓碑 pin）/ `recall --at` 时点快照与未来条目隔离 / 去重不连坐与孤儿回收（`purge --gc`）/ 事件条目的时点有效性（契约 H·I）/ 人格卡三槽预算·原子写·`--at` 回看·context 集成（契约 J）/ 分类型压缩阈值（普通 30 天·重要 90 天·情感锚点豁免）/ 结构化情感层（`affect`·显式情绪检索·隐私级联）/ 分层检索 v2（剪枝·事件过滤·混合相似度·事件级展开）。
+366 项（34 组），覆盖：时间覆盖 / 乱序补录 / 三维检索 / 内容寻址 / 分支 / context 预算 / 压缩 / 压缩梯度（`--keep-detail` 与结论必留）/ 物理清除 / 出图 / 参数校验 / 未来时间戳 / 保护位 / 硬锚点 / 非 ASCII 向量 / 热度计时器 / 事件层 / 五档分区 / 墓碑两段式 / 删除路径加固（保护位·共享地址·墓碑 pin）/ `recall --at` 时点快照与未来条目隔离 / 去重不连坐与孤儿回收（`purge --gc`）/ 事件条目的时点有效性（契约 H·I）/ 人格卡三槽预算·原子写·`--at` 回看·context 集成（契约 J）/ 分类型压缩阈值（普通 30 天·重要 90 天·情感锚点豁免）/ 结构化情感层（`affect`·显式情绪检索·隐私级联）/ 分层检索 v2（剪枝·事件过滤·混合相似度·事件级展开）。
 
 ```
 [1] 时间权重覆盖（越新越大）        ok ×4
@@ -328,12 +328,12 @@ bash scripts/selftest.sh
 [15] 热度只做压缩计时器              ok ×3
 [16] 采样 → 结算 → 打标签            ok ×9
 [17] 角色扮演污染防护                ok ×3
-[18] 手动标签与升/降噪               ok ×3
+[18] 手动标签与升/降噪               ok ×4
 [19] 事件层（SPEC §2.2 最小版）      ok ×5
 [20] 老库升级不炸（缺列自动补）       ok ×3
 [21] 五档分区（时间单向降级）         ok ×12
 [22] 老库补 zone/importance 并回填    ok ×3
-[23] 墓碑区：删除两段式              ok ×18
+[23] 墓碑区：删除两段式              ok ×19
 [24] 事件内细节梯度压缩（结论必留）   ok ×20
 [25] 删除路径加固（保护位/共享地址）  ok ×38
 [26] recall --at 时点快照 / 未来条目  ok ×36
@@ -342,9 +342,10 @@ bash scripts/selftest.sh
 [29] 契约 I：事件行不打现状标记      ok ×15
 [30] 契约 J：人格卡三槽/--at/context  ok ×47
 [31] 分类型压缩阈值（SPEC §4.2）   ok ×11
-[32] 情感层：affect/检索/隐私级联   ok ×18
-[33] 分层检索 v2（剪枝+事件展开）   ok ×15
-通过 337 / 失败 0
+[32] 情感层：affect/检索/隐私级联   ok ×22
+[33] 分层检索 v2（剪枝+事件展开）   ok ×20
+[34] 工单：purge 语义与终态        ok ×18
+通过 366 / 失败 0
 ```
 
 ---
@@ -369,7 +370,7 @@ memory-timeline/
 │   └── prompts.md        # 注入模板与抽取提示词
 └── scripts/
     ├── memtree.py        # 全部实现，单文件，零依赖
-    └── selftest.sh       # 337 项自检（33 组）
+    └── selftest.sh       # 366 项自检（34 组）
 ```
 
 ---

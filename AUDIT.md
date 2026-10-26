@@ -1,8 +1,8 @@
 # AUDIT —— 按 SPEC 逐节对照
 
-> 审计对象：本项目（v2.1，代码基线 **153d1fc**）在 2026-10 本轮改版后的状态。
+> 审计对象：本项目（v2.1，代码基线 **a9b4c68**）在 2026-10 本轮改版后的状态。
 > 验收标准：那份 12 节设计 SPEC（时间+事件二维图、五档分区、遗忘流水线、人格卡与三层锚点、情感层、上下文组装、落地选型、三条铁律、8 个待定参数）。
-> 证据行号全部指向 `scripts/memtree.py`（153d1fc 上 2,472 行，行号以该提交为准；历史改动记录里的行号保留其当时提交口径）。自检 `bash scripts/selftest.sh` → **通过 337 / 失败 0**（33 组）。
+> 证据行号全部指向 `scripts/memtree.py`（a9b4c68 上 2,550 行，行号以该提交为准；历史改动记录里的行号保留其当时提交口径）。自检 `bash scripts/selftest.sh` → **通过 366 / 失败 0**（34 组）。
 
 ## 一句话结论
 
@@ -22,7 +22,7 @@
 | §2.1 时间轴第一索引 | **已实现** | 写入、上下文边界、检索、压缩全部按 `t` | — |
 | §2.2 事件聚合节点 | **部分**（本轮落地最小版） | `nodes.event` 受控短标签（≤24 字，超长直接拒写）；`context` 事件轴段 `▣ 名 起~止 n条` 即跨期时间区间；现状行尾 `⟦名⟧`；`recall --event` 在分支过滤之后、算相似度之前剪枝（先剪枝后相似度） | 事件边界仍由外部 Agent 给（未做会话分段）；没有独立事件节点/事件级权重；同类型事件的秩位衰减未做 |
 | §2.3 三档时间权重 | **部分** | 过去衰减 `0.5^(abs(dt)/45d)`（`time_weight()` :76）、时间窗 `--days`、未来对称衰减 | 未来「越临近越高、过期转历史」是用 `abs()` 近似出来的，不是独立方向项；同类型事件的秩位衰减完全没有 |
-| §3 五档分区 | **已实现** | `nodes.zone`（hot/warm/cold/archive/tombstone）+ `zone_target()` + `zone --migrate` 单向降级；`blobs.hot` 0/1/2 是存储态 | 归档区磁盘配额、分区按分支差异化阈值没做 |
+| §3 五档分区 | **已实现**（+purged 终态） | `nodes.zone`（hot/warm/cold/archive/tombstone/purged）+ `zone_target()` + `zone --migrate` 单向降级；`purged` 只由 purge 真删进入，不参与检索/迁移/复生 | 归档区磁盘配额、分区按分支差异化阈值没做 |
 | §4.1 热度=计时器 | **已实现** | `heat_of()`：只算「距上次访问」，绝不累计次数；`compress --heat` 是唯一消费者 | — |
 | §4.1 动态因子采样（本轮新增） | **已实现** | `signal` 采样 → `settle` 一次性结算 → `label` → `pinned`；`_judge()` 走规则不调 LLM；`settle_log` 留审计 | 情感摘要的 `emotion_tags` 尚未结构化落库（目前只存 `signals.quote`） |
 | §4.2 分类型压缩阈值 | **已实现**（T3，`9124f20`） | `cmd_compress()` :1754；默认普通 30 天 / 重要（`importance≥0.7` 或 `pinned`）90 天 / 情感锚点（`label='emotional'` 或 `type='anchor'`）永不自动压缩（`automatic_cut()` :1766-1772）；显式 `--days` / `--before` 统一覆盖时间分档（:1763-1764），但不绕过 `is_conclusion()` 与保护位；自检 [31] 11 条 | `pinned` 仍受更强的「保护位永不自动压缩」既有硬闸约束，不因重要档 90 天而解禁 |
@@ -30,9 +30,9 @@
 | §5.4 保护位 | **已实现** | `--pin` / `pin <id> --off`（`cmd_pin()` :610）；context 永不裁剪、compress 跳过、purge 拒绝，**墓碑区里的保护位同样挡硬删**（`pinned_refs()` :454 不看 zone） | — |
 | §6 人格卡 | **已实现**（本轮，契约 J/J11） | 独立文件 `<db>.persona.md`（`persona_path()` :529-532，`--persona-file` 覆盖）；三段固定标题 `## 硬槽`/`## 软槽`/`## 可变槽`（`PERSONA_TITLES` :63）、一行一条 `- `；预算硬 300/软 350/可变 150/整卡 800（`PERSONA_SLOT_BUDGET` :66、`PERSONA_TOTAL_BUDGET` :67，用 `est_tokens()` :202）；`cmd_persona()` :622-722 中硬槽 `set` 必须 `--force`（:653-655），硬槽 `drop` 同样必须 `--force`（:689-703，契约 J11），超预算硬槽直接拒、软/可变最旧优先挤出并留 `op=evict`（:662-669）、挤不动整条回滚 `exit 2`（:670-673）；`persona_log` 表（:302-310）记 add/del/evict，`persona show --at T` 正向重放（`persona_replay()` :607-619）；`cmd_context()` 在首行后、锚点前插 `⚓人格·硬/软/可变` 三行、计入 `--budget` 但永不裁剪（:1185-1193），`--json` 增 `persona`（:1233-1239）；原子写（`persona_save()` :576-590） | 没有版本化（不进 `blobs`、无快照、无审批流）、没有漂移检测；卡文件被手改不进日志 |
 | §6.4 冲突检测 | **部分** | 锚点与现状并存时打 ⚑ 标记，不静默覆盖 | 不落 `conflict` 状态，没有「候选取舍」流程 |
-| §7 情感层 | **部分**（本轮结构化） | `affect` 独立表（`cmd_affect()` :633、建表 :306/:407）：`tags/intensity/valence/key_quote/source` 全落库；`signal --tags/--valence` → `settle` 聚合；固定 8 类 + `unspecified`；`recall --emotion` 激活情绪权重（α 默认 0.5，时间占 1-α）；`roleplay` 双入口拒绝；`purge` 级联删 `affect`。自检 [32] 18 条 | 情绪还没有常驻进 `context` 的情感状态段；标签仍由外部 Agent 给，没有自动打标/LLM 抽取 |
+| §7 情感层 | **部分**（本轮结构化） | `affect` 独立表（`cmd_affect()` :633、建表 :306/:407）：`tags/intensity/valence/key_quote/source` 全落库；`signal --tags/--valence` → `settle` 聚合；固定 8 类 + `unspecified`；`recall --emotion` 激活情绪权重（α 默认 0.5，零命中自动退回 0 并报 `emotion.matched/alpha_applied`）；`roleplay` 双入口拒绝；`purge` 级联删 `affect`。自检 [32] 22 条 | 情绪还没有常驻进 `context` 的情感状态段；标签仍由外部 Agent 给，没有自动打标/LLM 抽取 |
 | §8.1 上下文组装 | **部分** | 组装顺序固定：锚点 → 现状 → 分支 → 事件 → 图例 → `⏳` 未来段；硬预算；溢出显式标记（:1000） | 不含情感状态层、不含 3~5 条热记忆预取、滑窗归 Agent 侧 |
-| §8.3 分层检索 | **部分**（v2 灰度） | `recall --pipeline v2`（`cmd_recall()` :1450）：有效性门 → 时间窗 → 事件过滤 → `0.85*cos+0.15*lexical` 混合 → 时间/情绪加权 → 事件单元展开；`pipeline` 每级报 `in/pruned/out`，未来单列 `future_hidden`；`--at` 锚定 T。自检 [33] 15 条 | 默认仍是 `legacy`，v2 尚未成为默认；事件级独立权重/秩位衰减仍未做 |
+| §8.3 分层检索 | **部分**（v2 灰度） | `recall --pipeline v2`（`cmd_recall()` :1450）：有效性门 → 时间窗 → 事件过滤 → `0.85*cos+0.15*lexical` 混合 → 时间/情绪加权 → 事件单元展开；`pipeline` 每级报 `in/pruned/out`，未来单列 `future_hidden`；`--at` 锚定 T。自检 [33] 20 条；`--expand` 截断报 `units_skipped/members_dropped/warning` | 默认仍是 `legacy`，v2 尚未成为默认；事件级独立权重/秩位衰减仍未做 |
 | §9 落地选型 | **部分** | SQLite 元数据 ✅、单文件零依赖 ✅、CLI+JSON 工具接口 ✅ | 原文没有落到文件系统（在 `blobs` 里）、没用 FTS5/sqlite-vec、无后台调度（没有日终 consolidation）；MCP 只有设计稿（`references/mcp.md`），**未实现**；无 `update_persona / affect.update` |
 | §9 MVP P1 | **已实现** | 建表 + 写入 + 覆盖 + 时间窗检索 + context 组装 | — |
 | §9 MVP P2 | **部分** | 热度衰减 + 压缩 + 归档 | 无区域迁移、无日终 consolidation 调度 |
@@ -74,6 +74,7 @@
 | 26 | **分类型压缩阈值**（SPEC §4.2） | `cmd_compress()` :1754 / `automatic_cut()` :1766-1772 / CLI `--days` 默认 None :2068 / scripts/selftest.sh [31] | 默认不再一刀切 30 天：普通 30 天；重要（`importance≥0.7` 或 `pinned`）90 天；`label='emotional'` 或 `type='anchor'` 永不自动压缩。显式 `--days` / `--before` 仍统一覆盖时间分档（老行为），但不绕过 `is_conclusion()` 与保护位。自检 [31] 11 条：三档边界、1000 天情绪/锚点仍 active、显式覆盖、缺 `importance` 老库可直接 compress。（`9124f20`） |
 | 27 | **结构化情感层 + 显式情绪检索**（SPEC §7） | `affect` 表 :306/:407 / `normalize_affect_tags()` / `affect_add()` / `affect_relevance()` / `cmd_affect()` :633 / `cmd_signal()` / `cmd_settle()` / `cmd_recall()` :1450 / `cmd_purge()` 级联 / CLI :2320 | 情绪不再只靠 `signals.quote` 裸存：`affect` 保存标签、强度、效价、原话、来源；固定 8 类 + `unspecified`，中文别名可输入，未知标签拒绝。`recall --emotion` 才启用情绪维，`S=sim*((1-α)*time+α*emotion+outcome)`，默认 α=0.5；不带参数时输出与旧版逐键相同。`roleplay` 的 settle 与手写 `affect set` 双入口拒绝；`purge --apply/--now` 级联删情感行。自检 [32] 18 条。（`26069d8`） |
 | 28 | **分层检索 v2**（SPEC §8.3，灰度） | `cmd_recall()` :1450 / `--pipeline` :2378 / `--expand` / scripts/selftest.sh [33] | 新增 `--pipeline v2`：有效性门 → 时间窗 → 事件过滤 → `0.85*cos+0.15*lexical` 混合相似度 → 时间/情绪加权 → 事件单元逐级展开。每级 `in=pruned+out`，未来条目单列 `future_hidden` 不占 topN，`--at` 的时间窗锚定 T。默认仍 `legacy`，老输出不变。自检 [33] 15 条。（`153d1fc`） |
+| 29 | **工单修复 F1–F6 + 公开准备 G1/G2** | `cmd_recall()` / `cmd_purge()` / `cmd_label()` / `PROJECT_STATE.md` / `.gitignore` | F1 v2 展开截断报数；F2 `--now` 覆盖既有墓碑并拆 `purged_existing/purged_now`；F3 情绪零命中退回 α=0；F4 apply 后转 `purged` 终态；F5 正文已抹拒绝 restore；F6 noise 摘保护位显式报 `pin_revoked`。G1 清本机绝对路径，G2 发布 `DESIGN.md`。自检从 337/33 → 366/34。 |
 
 ## 明确没做（别误以为有）
 
@@ -96,7 +97,7 @@
 ## 怎么复核本文件
 
 ```bash
-bash scripts/selftest.sh          # 期望：通过 337 / 失败 0（33 组）
+bash scripts/selftest.sh          # 期望：通过 366 / 失败 0（34 组）
 python scripts/memtree.py context --budget 200   # 期望：末行有「⚠ 还有 N 条未展开」
 python scripts/memtree.py stats                   # 期望：有 protected 与 heat 两段
 ```

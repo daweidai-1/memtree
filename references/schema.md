@@ -41,7 +41,7 @@
 | `purge_reason` | 删除理由（隐私/错误/用户要求）。删完也保留，用于事后审计 |
 | `accessed_at` | REAL，epoch 秒，最后一次被 `recall`/`signal` 碰过的时间。**只用于算热度，不累计次数** |
 | `label` | `anchor / emotional / noise / NULL`。**`settle` 的结算产物**：写入后不可由热度改写 |
-| `zone` | `hot / warm / cold / archive / tombstone`。**只随时间单向降级**：≤7d 热、7~90d 温、更旧则 `importance ≥ 0.7`（或保护位/锚点）进冷区、否则归档。升级只能 `zone --id <n> --set` —— 调用次数不许升区 |
+| `zone` | `hot / warm / cold / archive / tombstone / purged`。前四档只随时间单向降级：≤7d 热、7~90d 温、更旧则 `importance ≥ 0.7`（或保护位/锚点）进冷区、否则归档。`tombstone` 只由 purge 进入；`purged` 是正文已永久删除的终态，不参与检索/上下文/迁移，也不能 restore |
 | `importance` | REAL 0~1，默认 0.5。**只参与分区下限，不参与排序**（排序永远由时间说话） |
 | `event` | 受控短标签（≤24 字）。**聚合键，不是句子**：同一件事的多次提及共用一个 `event`，`context` 据此输出 `▣ 名 起~止 n条`（`MIN(t)/MAX(t)` 即跨期区间），`recall --event` 用它在算相似度之前剪枝 |
 | `source_type` | `stated / roleplay / inferred / system`。`roleplay` 永不打情感锚点（防虚构污染） |
@@ -121,16 +121,16 @@ persona_log(id INTEGER PK AUTOINCREMENT, t REAL, slot TEXT, op TEXT, old TEXT, n
 
   任意 zone/status 的候选 ──purge──► zone='tombstone'（正文仍在库，已从检索/上下文消失）
                                          │ 冷却 7 天（PURGE_COOLDOWN_DAYS），--restore 可撤回
-                                         │ purge --apply（期满才真删，唯一不可逆入口）
+                                         │ purge --apply（期满）或 --now（立即，覆盖所有墓碑）
                                          ▼
-                                   正文清除，地址悬空（hot=2）
+                                   zone='purged' 终态：正文清除，地址悬空（hot=2）
 ```
 
 - 只有 `active` 进 `context` 的 `■`。
 - `superseded` 只以 `factor` 出现在新记忆的括号里。
 - `purged` 的地址仍可用于**去重**和"曾经有过这条"的溯源，但取不回原文。
 - `pinned=1` 的节点不参与任何降级：`compress` 跳过它，`purge` 直接拒绝（要清先 `pin <id> --off`）。**墓碑区里的保护位照样有效** —— `pinned_refs()` 不看 zone，同一地址上任何一条钉住，整条地址就不抹正文（§5.6）。
-- `tombstone` 是 **zone 不是 status**：进墓碑区的节点仍带着 `active/superseded/archived`，只是被排除出检索与上下文；`tombstoned_at` 起算 7 天后才允许 `--apply` 抹正文。
+- `tombstone` 是 **zone 不是 status**：进墓碑区的节点仍带着 `active/superseded/archived`，只是被排除出检索与上下文；`tombstoned_at` 起算 7 天后才允许 `--apply` 抹正文。真删成功后 `zone='purged'`、`tombstoned_at=NULL`，从此不在墓碑队列，也不能 restore。
 - 反过来，**墓碑里不许打保护位**（`pin` 拒绝，提示先 `purge --restore`）：否则谁都能临时钉一下再删，保护位就成了假动作（§5.6 硬拦③）。
 - `competing` 是保留状态位：用于「两条现状互相矛盾、等用户裁决」的场景，目前没有写入路径，`recall --status competing` 恒为空。
 - `compress` 只动**细节**：被压的细节转 `archived` 并在 `rolled_into` 记住去处，结论节点原样留在 `active`——见 §5.5。
@@ -217,14 +217,16 @@ or outcome != 0 or label in (anchor, emotional)
 |---|---|
 | `purge` | 整批进墓碑区：`status IN ('superseded','archived')` 且 `pinned=0` 且 `type != anchor` 且 `zone != 'tombstone'` |
 | `purge --addr <前缀>` | 按地址进墓碑区（该地址上的节点一起进）；地址上有保护位或锚点 → 整次调用直接拒绝 |
-| `purge --list` | 看墓碑排队、理由与剩余天数 `days_left` |
-| `purge --apply` | **唯一的不可逆入口**：期满才抹正文 |
+| `purge --list` | 只看尚未结案的墓碑：排队、理由与剩余天数 `days_left` |
+| `purge --apply` | 期满才抹正文，并把节点转 `zone='purged'` 终态 |
 | `purge --restore <id>` | 冷却期内撤回（正文从未删除，分区按时间重算） |
-| `purge --now` | 跳过冷却立即删：隐私 / 错误信息（跳过冷却 ≠ 跳过引用计数与保护位） |
+| `purge --now` | 跳过冷却立即删：**覆盖所有墓碑节点**（含本轮之前就在墓碑区的），返回 `purged_now`（本轮新进）与 `purged_existing`（既有墓碑）；跳过冷却 ≠ 跳过引用计数与保护位 |
 | `purge --gc [--dry-run]` | 回收孤儿正文：只删 `blobs` 行，**不删任何 `nodes` 行** |
 | `--reason "<理由>"` | 记进 `purge_reason`，删完也保留（事后审计要能回答「谁为什么删的」） |
 
 进墓碑区只是 `zone='tombstone'` + `tombstoned_at` + `purge_reason`：正文还在库里，但已从 `recall` 与 `context` 消失。冷却期常量 `PURGE_COOLDOWN_DAYS = 7.0`。
+
+`--restore` 先验正文：`zone='purged'` 或 blob `hot=2/正文空` 一律 `exit != 0`，文案为「正文已永久删除，无法撤回」，且不改 zone/status；只有正文完好的墓碑节点才能回到按时间重算的分区。
 
 ### 三条硬拦（`--apply` 与 `--now` 都要过）
 
@@ -356,15 +358,16 @@ $ memtree context
 ⏳ 未来 1 条尚未发生（不参与现状判定） —— 显式查：recall --at <该日期之后> 或 log --all
 ```
 
-## 5.10 自检覆盖的契约（[25] / [26] / [31]–[33]）
+## 5.10 自检覆盖的契约（[25] / [26] / [31]–[34]）
 
 | 组 | 条数 | 断言的契约 |
 |---|---|---|
 | `[25]` 删除路径加固 | 38 | 保护位挡住 `--apply`（含墓碑区内的 pinned）；共享地址不抹正文；`--addr` 遇保护位/锚点整次拒绝；墓碑区不许 `pin`；冷却未满不删；期满真删后正文为空、`hot=2`、节点行仍在；`--restore` 分区按时间重算；`--now` 跳过冷却但**不跳过**引用计数；**计数归属**：同一地址同时命中时只计 `skipped_pinned`、不重复计 `skipped_shared`；被跳过的正文仍活着 |
 | `[26]` 时点快照 / 未来隔离 | 36 | `--at` 返回「T 那一刻是现状」的条目、不返回 T 之后才写的；T 之前已被覆盖的条目不当现状；`--at` 早于全部条目 → 空命中而不是拿后写的冒充；`status`(当时)/`status_now`(现在) 分叉；`--at` 下读全文非占位；`as_of` 回显、`as_of_stats` 四个键齐全；深回溯按 `se` 判而不被 Σ 饿死（带 `low_confidence`/`overlap`）；`context` 出 `⏳` 段且 `■` 不含未来条目；被未来覆盖者按 `gone_at > now` 补回并标 `(覆盖者在未来·此刻仍是现状)`；`total.future`；未来条目不免疫压缩 |
 | `[31]` 分类型压缩阈值（§5.5） | 11 | 普通 31 天进候选；重要 31 天不进、91 天进；`label=emotional` 31/1000 天都不进；`type=anchor` 1000 天不进；默认只压两条；显式 `--days` 让重要 31 天进候选；显式参数不绕过情感/锚点硬闸；缺 `importance` 老库可直接 compress 且列被补回 |
-| `[32]` 情感层（§4 affect / §7） | 18 | 中文别名规范化；settle 落结构化 affect；多条观察不覆盖；未知标签拒绝；roleplay 不落情感层；无 `--emotion` 老输出键不变；情绪查询重排；`affect clear` 不删记忆；`purge` 级联清标签与原话；缺情感列老库可打开 |
-| `[33]` 分层检索 v2（§5.12） | 15 | legacy 无 pipeline 对象；v2 六段审计齐全；未来单列不进 topN；每级 in=pruned+out；时间窗/事件过滤报数；事件单元展开与正文加载计数；`--at` 锚定 T 且 as_of 统计不丢；`--expand 0` 拒绝 |
+| `[32]` 情感层（§4 affect / §7） | 22 | 中文别名规范化；settle 落结构化 affect；多条观察不覆盖；未知标签拒绝；roleplay 不落情感层；无 `--emotion` 老输出键不变；情绪查询重排；零命中退回 α=0 且分数逐位不变；部分命中保持 0.5；`affect clear` 不删记忆；`purge` 级联清标签与原话；缺情感列老库可打开 |
+| `[33]` 分层检索 v2（§5.12） | 20 | legacy 无 pipeline 对象；v2 六段审计齐全；未来单列不进 topN；每级 in=pruned+out；时间窗/事件过滤报数；事件单元展开与正文加载计数；`--expand` 截断报 `units_skipped/members_dropped/warning`，未截断为 0/null；`--at` 锚定 T 且 as_of 统计不丢；`--expand 0` 拒绝 |
+| `[34]` purge 语义（F2/F4/F5） | 18 | `--now` 覆盖既有墓碑并拆 `purged_existing/purged_now`；无墓碑文案准确；`--apply` 转 purged 终态、列表归零、再 apply 0/0、recall 不命中；老库 ghost 迁移；正文已抹 restore 拒绝且状态不变；冷却期 restore 成功可检索 |
 
 ## 5.11 人格卡：卡在文件系统，日志在库（SPEC §6）
 
@@ -473,8 +476,11 @@ $ memtree persona show --at 2020-01-01
  "event_filter":{"event":"E1","in":3,"pruned":1,"out":2},
  "similarity":{"coarse":"vector_cos","hybrid":"0.85*cos+0.15*lexical","candidates":2,"kept":2},
  "ranking":{"time":1.0,"emotion":0.0,"outcome":1.0},
- "expand":{"units":1,"units_expanded":1,"members_scored":2,"bodies_loaded":2}}
+ "expand":{"units":1,"units_expanded":1,"units_skipped":0,"members_scored":2,
+           "members_dropped":0,"bodies_loaded":2,"warning":null}}
 ```
+
+`--expand N` 截断时 `units_skipped/members_dropped` 必须 >0，并在 `warning` 写明「--expand 增大可纳入」；未截断时两字段为 0、`warning` 为 null。非 JSON 模式同一 warning 打到 stderr。
 
 每一级都满足 `in = pruned + out`，不允许静默截断。`--at` 下时间窗锚定 T，`not_yet/already_gone/unknown_timing` 仍按原有口径给全；`t > now` 的真实未来条目任何 `--at` 都不返回。
 

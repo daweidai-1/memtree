@@ -22,15 +22,15 @@
 |---|---|
 | `SKILL.md` | Agent 入口，每次会话加载（实测 **3,221 token**）。只留操作信息 + **图例行** |
 | `README.md` | 对外说明：解决什么问题、D1–D4 设计决定、实测账、与 mem0/Zep/Letta 对比、安装、自检输出 |
-| `AUDIT.md` | 按 SPEC 逐节对照（哪节已实现/部分/未实现）+ 改动记录 28 条 + 明确没做 + 下一期建议 |
+| `AUDIT.md` | 按 SPEC 逐节对照（哪节已实现/部分/未实现）+ 改动记录 29 条 + 明确没做 + 下一期建议 |
 | `PROJECT_STATE.md` | **本文件**：跨会话进度台账（能力状态、缺口、安装态、接手指南） |
 | `DESIGN.md` | 早期设计稿（问题定义、四个设计决定、代价），保留作思路存档；**与实现冲突时以 AUDIT.md 为准** |
 | `references/schema.md` | 表结构、状态机、权重公式、**§5.5 压缩梯度**、subject 命名、换真嵌入的方法 |
 | `references/theory.md` | 数学推导（复平面模型、打分分解、时间旅行），按需读，不进 SKILL |
 | `references/prompts.md` | 注入模板与抽取提示词 |
 | `references/mcp.md` | MCP 封装**设计稿**（四工具契约、两阶段删除确认、未实现） |
-| `scripts/memtree.py` | **全部实现**，单文件 153d1fc 上 2,472 行，argparse 子命令 + SQLite，零第三方依赖 |
-| `scripts/selftest.sh` | 337 项自检（33 组），末尾打印 `通过 N / 失败 M`，`FAIL>0` 则 exit 1 |
+| `scripts/memtree.py` | **全部实现**，单文件 a9b4c68 上 2,550 行，argparse 子命令 + SQLite，零第三方依赖 |
+| `scripts/selftest.sh` | 366 项自检（34 组），末尾打印 `通过 N / 失败 M`，`FAIL>0` 则 exit 1 |
 | `bin/memtree` / `bin/memtree.cmd` | POSIX / Windows 启动器，按 `MEMTREE_PY → python3 → python → py` 找解释器 |
 | `.github/workflows/selftest.yml` | CI：Python 3.8/3.11/3.13 三档跑同一份自检 + CLI 冒烟 |
 | `.gitattributes` / `.gitignore` / `LICENSE` | 行尾规范化 / 忽略规则 / MIT |
@@ -51,7 +51,7 @@ DB 默认 `./.workbuddy/memory/memtree.db`，用 `MEMTREE_DB` 覆盖（按项目
 | 热度与压缩计时器 | **已实现** | `heat_of()`:87 = `0.5^(距上次访问天数/45)`，**只看「距上次访问」，不累计次数**；衰减起点是 `max(accessed_at, min(t, now))` —— 未来条目不许把起点跑进未来；唯一消费者 `compress --heat`；`stats` 热度直方图 `_heat_hist()`:1624 | 自检 [15] 3 条；热度不进 `weight()` —— 不参与排序、不进上下文、不升区 |
 | 采样 → 结算 → 打标签 | **已实现** | `signal --type user_confirm\|correction\|emotional_peak\|repeat_mention`；`settle`（`_judge()`:645 走规则、不调 LLM）；`label <id> anchor\|emotional\|noise\|clear`；`signals` + `settle_log` 两表 | 自检有「anchor 不被压缩」「noise 豁免热度门」；每次结算写 `settle_log`，可审计 |
 | 五档分区 hot/warm/cold/archive/tombstone | **已实现** | `nodes.zone` + `ZONES`:53 + `zone_target()`:306；`zone --migrate` **单向降级**、`zone --id N --set X` **唯一升级入口**（`tombstone` 除外，:1586 拒绝）；`context` 分区门；`recall --zone`；`stats.by_zone` | 自检：冷区/墓碑条数必须明说、不许静默隐藏；老库补列后按时间回填一次（否则单向降级从第一天就不成立） |
-| 墓碑两段式删除 | **已实现**（`d330b28` 加固） | `purge`（`cmd_purge()`:1266）：默认进墓碑（`zone='tombstone'` + `tombstoned_at` + `purge_reason`），冷却 `PURGE_COOLDOWN_DAYS=7.0`:55；`--apply` 期满真删、`--restore` 撤回、`--now` 隐私直通车、`--list` 报 `days_left`、`--addr` 按地址、`--reason` 记理由 | 自检 [23] 18 条 + [25] 38 条 |
+| 墓碑两段式删除 | **已实现**（`d330b28` 加固 + F2/F4/F5） | `cmd_purge()`：默认进墓碑（`zone='tombstone'` + `tombstoned_at` + `purge_reason`），冷却 `PURGE_COOLDOWN_DAYS=7.0`；`--apply` 期满真删并转 `purged` 终态；`--now` 覆盖所有既有/新进墓碑，拆 `purged_existing/purged_now`；`--restore` 正文已抹则拒绝；`--list` 只列未结案墓碑 | 自检 [23] 19 条 + [25] 38 条 + [34] 18 条 |
 | 删除路径三条硬拦 | **已实现**（`d330b28` / `5855fea`） | `pinned_refs()`:454（**含墓碑区内的 pinned**）→ `skipped_pinned`；`live_refs()`:442（`zone<>'tombstone'`，active/superseded/archived 全算）→ `skipped_shared`；`cmd_pin()` :573 拒绝墓碑区节点。计数归属：同时命中只计 `skipped_pinned` | 自检 [25]：共享地址不抹正文、`--now` 不跳过引用计数、`pin` 墓碑被拒、`zone --set tombstone` 被拒（:1586） |
 | **事件内细节梯度压缩**（SPEC §5 ①） | **已实现**（`446fd66`） | `compress --keep-detail N`（默认 1）+ `--min-count`（默认 3）+ `is_conclusion()`:1743 + `cmd_compress()`:1754；`nodes.rolled_into`、`meta{rolled,ids,event,kept_detail}` | 自检 `[24]` 20 条断言全绿：`rolled_into` 指向 / `hot=0` 非删除 / 最新 N 条逐字保留 / 事件标签继承 / 两事件不合并 / 四类结论必留 / `conclusions_preserved` 精确性 / `--keep-detail 0` 退化 / 二次压缩幂等。文档落点：`references/schema.md` §5.5、README「压缩是梯度，不是剪切」、SKILL 的 compress 段、AUDIT #16 |
 | **分类型压缩阈值**（SPEC §4.2） | **已实现**（`9124f20`） | `cmd_compress()`:1754 + `automatic_cut()`:1766：默认普通 30 天 / 重要（`importance≥0.7` 或 `pinned`）90 天 / 情感锚点（`label=emotional` 或 `type=anchor`）永不自动压缩；显式 `--days`/`--before` 统一覆盖时间分档，但不绕过结论与保护位 | 自检 `[31]` 11 条全绿：普通 31 天进、重要 31 天不进 / 91 天进、情绪 31/1000 天不进、锚点 1000 天不进、显式覆盖、缺 `importance` 老库可跑 |
@@ -81,8 +81,8 @@ DB 默认 `./.workbuddy/memory/memtree.db`，用 `MEMTREE_DB` 覆盖（按项目
 ### 4.1 文档类缺口（不影响功能，但会误导人）
 
 - **token 数没有可信来源**：`context` 358 token / 轮、22 条库那组数据都是「事件层 + 分区层」之前的测量；`SKILL.md` 的 token 数（曾写 3,221）会随文档改动漂移，**引用前请重测**，别把旧数字当真。
-- **CI step 名**：`.github/workflows/selftest.yml` 已改成 `Run 337 self-tests`。新增自检组时记得同时改它，否则 CI 日志的名字会撒谎。
-- **README 自检徽章/项数**已按本轮实测校正为 `337/337`、`337 项（33 组）`，组表格补到 `[33]`。
+- **CI step 名**：`.github/workflows/selftest.yml` 已改成 `Run 366 self-tests`。新增自检组时记得同时改它，否则 CI 日志的名字会撒谎。
+- **README 自检徽章/项数**已按本轮实测校正为 `366/366`、`366 项（34 组）`，组表格补到 `[34]`。
 
 ---
 
@@ -92,11 +92,11 @@ DB 默认 `./.workbuddy/memory/memtree.db`，用 `MEMTREE_DB` 覆盖（按项目
 
 | 项 | 值 |
 |---|---|
-| 代码基线 | **`153d1fc`** `feat: add staged retrieval pipeline v2` |
-| 本轮关键提交 | `153d1fc` 分层检索 v2（SPEC §8.3） · `26069d8` 结构化情感层（SPEC §7） · `9124f20` 分类型压缩阈值（SPEC §4.2） · `09869c9` context 图例补 `⚓人格`（契约 J12） · `6ddb0d1` J11 回归断言 · `0040ea3` 人格硬槽 drop 防漂移 · `12bbccb` 人格卡 + 三层锚点预算（契约 J） · `d330b28` 删除路径三条硬拦 |
+| 代码基线 | **`a9b4c68`** `fix(label): report pin revocation on noise (F6)` |
+| 本轮关键提交 | `e2f0bde` F1 v2 展开报数 · `42e07b1` F3 情绪零命中降级 · `ca940ac` F2 `--now` 覆盖既有墓碑 · `88055ea` F4 apply 终态 · `49e4f9b` F5 restore 拒绝永久删除 · `a9b4c68` F6 撤保护位提示 · `2a2a056` G1 清绝对路径 · `f7945ba` G2 发布 DESIGN · 更早：`153d1fc` v2 · `26069d8` affect · `9124f20` 分档压缩 |
 | 更早的骨架提交 | `1349794` 文档排序 · `c3c9414` 墓碑区 + 两段式删除 · `bf58645` 五档分区 · `812c828` 事件层最小版 · `13c4f40` 采样→结算→标签 |
-| 自检项数 | **337 项 / 33 组** |
-| 自检结果 | **通过 337 / 失败 0**（`153d1fc` 工作区实测，33 组） |
+| 自检项数 | **366 项 / 34 组** |
+| 自检结果 | **通过 366 / 失败 0**（`a9b4c68` 代码 + G 文档实测，34 组） |
 
 ### 5.1.1 批次记录：T1 文档收尾
 
@@ -139,6 +139,13 @@ DB 默认 `./.workbuddy/memory/memtree.db`，用 `MEMTREE_DB` 覆盖（按项目
 - **自检增量**：`+0`；仍为 **337 / 0（33 组）**，本批只写设计文档，不写实现。
 - **契约编号**：SPEC §9；T6 四工具 `commit/recall/context/purge`。
 - **已知取舍**：MCP 层设计为可选 stdio 适配器，核心保持零依赖；`purge` 用两阶段 preview token，候选集变化即拒绝，且禁止 `all=true`。实现前置：CLI 需先补 `purge --ids` 精确入口与 `commit --json`；在 `purge --ids` 落地前，MCP 只开放 `list/stage/restore/gc`，不暴露 `apply/now`。
+
+### 5.1.7 批次记录：工单 F1–F6 + G1/G2
+
+- **提交链**：`e2f0bde` F1 · `42e07b1` F3 · `ca940ac` F2 · `88055ea` F4 · `49e4f9b` F5 · `a9b4c68` F6 · `2a2a056` G1 · `f7945ba` G2。
+- **自检增量**：`+29`；从 337/33 到 **366/34，通过 366 / 失败 0**。
+- **关键语义**：`--now` 覆盖所有墓碑并拆 `purged_existing/purged_now`；`--apply` 后转 `purged` 终态；正文已抹的 `--restore` 拒绝；v2 展开截断报数；情绪零命中退回 α=0；`label noise` 显式报 `pin_revoked`。
+- **公开准备**：PROJECT_STATE 本机绝对路径清零；DESIGN.md 从 `.gitignore` 移除并纳入版本库（老大选 a）。
 
 > 提交号会变，别只信这张表：`git log --oneline -3` 永远是对的。
 
