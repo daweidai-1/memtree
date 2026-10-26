@@ -50,8 +50,9 @@ ANCHOR = "anchor"      # 硬锚点：身份/关系里程碑/安全约束。不�
 GLYPH = {"active": "●", "superseded": "◐", "archived": "○", "competing": "◆"}
 # 分区（SPEC §3）：时间单向降级 hot→warm→cold→archive。升级只能显式（zone --set），
 # 因为「被问得多」不等于「值得记住」—— 调用次数不许把球往回推（铁律一）。
-ZONES = ("hot", "warm", "cold", "archive")
-ZONE_RANK = {"hot": 0, "warm": 1, "cold": 2, "archive": 3}
+ZONES = ("hot", "warm", "cold", "archive", "tombstone")
+ZONE_RANK = {"hot": 0, "warm": 1, "cold": 2, "archive": 3, "tombstone": 4}
+PURGE_COOLDOWN_DAYS = 7.0           # 墓碑区冷却期：删除不可逆，缓冲几天给手滑与「真要删」区分开
 HOT_DAYS, WARM_DAYS = 7.0, 90.0     # 热 ≤7 天；温 7~90 天；更旧则看重要度：冷（保护区）或归档
 COLD_MIN_IMPORTANCE = 0.7           # 进冷区（保护区）的重要度下限：冷区不是垃圾桶
 DEFAULT_DB = os.path.join(".workbuddy", "memory", "memtree.db")
@@ -332,6 +333,8 @@ def _migrate(conn):
                       ("event", "TEXT"),
                       ("zone", "TEXT NOT NULL DEFAULT 'hot'"),
                       ("importance", "REAL NOT NULL DEFAULT 0.5"),
+                      ("tombstoned_at", "REAL"),
+                      ("purge_reason", "TEXT"),
                       ("source_type", "TEXT NOT NULL DEFAULT 'stated'")):
         if name not in cols:
             conn.execute(f"ALTER TABLE nodes ADD COLUMN {name} {ddl}")
@@ -702,7 +705,15 @@ def cmd_context(conn, a):
     _hid_ids = {r["id"] for r in stateful
                 if (r["zone"] or "hot") not in ("hot", "warm") and not r["pinned"]
                 and r["label"] != "anchor"}
-    _zone_hidden = len(_hid_ids)
+    # 墓碑区单算：它和冷/归档不是一回事 —— 前者是「已受理删除」，后者是「还在库里只是低频」
+    # 墓碑要按全类型数，不能只数 fact/pref/decision：一条被删掉的 event 同样不许静默消失
+    _tomb_hidden = conn.execute(
+        "SELECT COUNT(*) c FROM nodes WHERE zone='tombstone' AND (scope='global' OR branch=?)",
+        (branch,)).fetchone()["c"]
+    # 冷/归档计数只减掉「同属现状类型且被判墓碑」的那些：墓碑全类型计数更大，
+    # 直接相减会算出 -1（一条被删的 event 不在 stateful 里，却进了 _tomb_hidden）
+    _zone_hidden = len(_hid_ids) - len({r["id"] for r in stateful
+                                        if (r["zone"] or "hot") == "tombstone"} & _hid_ids)
     stateful = [r for r in stateful if r["id"] not in _hid_ids]
     wmap = _w(conn, stateful, now_e)
     anchored_sub = {x["subject"] for x in conn.execute(
@@ -749,7 +760,8 @@ def cmd_context(conn, a):
                 line += f"  ({r['factor']})"
             facts.append(line)
 
-    for r in reversed(_rows(conn, """SELECT * FROM nodes WHERE status='active' AND type='hypothesis' AND branch=?""",
+    for r in reversed(_rows(conn, """SELECT * FROM nodes WHERE status='active' AND type='hypothesis'
+                                     AND branch=? AND (zone IS NULL OR zone!='tombstone')""",
                             (branch,))):
         facts.append(f"◇ {r['subject'] or '假设'}: {clip(content_of(conn, r['addr'], True), a.width)}")
 
@@ -771,8 +783,10 @@ def cmd_context(conn, a):
         tip = clip(content_of(conn, h["addr"], True), 30) if h else "(空)"
         branches.append(f"○ {b['name']}#{b['head_id'] or '-'} {tip}")
 
+    # 墓碑区是「已受理删除」：连事件轴都不许出现，否则删除只删了 status、没删掉记忆
     ev = [r for r in _rows(conn, """SELECT * FROM nodes WHERE status='active'
-                                    AND type IN ('event','merge','summary')""") if r["branch"] == branch]
+                                    AND type IN ('event','merge','summary')""")
+          if r["branch"] == branch and (r["zone"] or "hot") != "tombstone"]
     picked = ev[-a.recent:] if a.recent else []
     picked += [r for r in ev if r["type"] == "summary" and r["id"] not in {p["id"] for p in picked}][-2:]
     for r in sorted(picked, key=lambda r: (r["t"], r["id"]), reverse=True):
@@ -781,7 +795,7 @@ def cmd_context(conn, a):
     n_all = conn.execute("SELECT COUNT(*) c FROM nodes").fetchone()["c"]
     n_cold = conn.execute("SELECT COUNT(*) c FROM nodes WHERE status!='active'").fetchone()["c"]
     head = conn.execute("SELECT head_id FROM branches WHERE name=?", (branch,)).fetchone()["head_id"]
-    legend = ("※ ⚓锚点 ■现状 ▣事件轴 ⟦事件名⟧ ❄冷 ★钉=保护位 ◇假设 ○分支(回顾点) ·事件"
+    legend = ("※ ⚓锚点 ■现状 ▣事件轴 ⟦事件名⟧ ❄冷 🪦墓碑 ★钉=保护位 ◇假设 ○分支(回顾点) ·事件"
               "  (曾:…@日期)=已废弃，禁止当作现状")
     head_line = (f"【记忆 {ref.strftime('%Y-%m-%d')} | {branch}#{head or '-'} "
                  f"| {n_all}节点·废{n_cold}】")
@@ -814,6 +828,9 @@ def cmd_context(conn, a):
     out = "\n".join(rebuild())
     # 静默丢状态是本项目最贵的 bug：模型看到 18 条就会笃定答「没记录过」。
     # 溢出必须说出来 —— 宁可超预算一行，也不能让 Agent 以为自己看到了全部。
+    if _tomb_hidden:
+        out += (f"\n🪦 墓碑区 {_tomb_hidden} 条已受理删除（冷却期内可撤回）"
+                " —— 显式查：recall --zone tombstone / purge --list")
     if _zone_hidden:
         out += (f"\n❄ 冷区/归档 {_zone_hidden} 条未加载（保护位与锚点除外）"
                 " —— 显式查：recall --zone cold 或 recall --zone archive")
@@ -883,6 +900,9 @@ def cmd_recall(conn, a):
         if a.event and (r["event"] or "") != a.event:   # 事件层过滤：先按事件剪枝，再算相似度
             continue
         if a.zone and (r["zone"] or "hot") not in [z.strip() for z in a.zone.split(",")]:
+            continue
+        # 墓碑区默认检索不到：已受理删除的记忆不该在「我以前说过什么」里冒出来
+        if not a.zone and (r["zone"] or "hot") == "tombstone":
             continue
         # 不硬性过滤"未来"：事件的结果可能在事后才确定。
         # "当时的状态"由上面的 cur_ids 保证（同 subject 只留 t≤t_ref 的最大者）。
@@ -967,13 +987,15 @@ def cmd_log(conn, a):
         if brief:
             # 精简模式：去掉地址、权重、分支与对齐空白。
             # 这些字段只在调试/校验时有用，Agent 读时间轴时是纯噪音（占一行 29%）。
-            print(f"#{r['id']} {short_date(r['t'], ref)} {GLYPH.get(r['status'],'?')} "
+            print(f"#{r['id']} {short_date(r['t'], ref)} {GLYPH.get(r['status'],'?')}"
+                  f"{'🪦' if (r['zone'] or '') == 'tombstone' else ''} "
                   f"{clip(content_of(conn, r['addr'], True), a.width)}"
                   + (f" ({r['factor']})" if r["factor"] else ""))
             continue
         pb = allbr.get(r["parent_id"])
         fork = f"  ↳from {pb}" if pb and pb != r["branch"] else ""
-        print(f"#{r['id']:<4} {r['ts_iso'][:16].replace('T',' ')} {GLYPH.get(r['status'],'?')} "
+        print(f"#{r['id']:<4} {r['ts_iso'][:16].replace('T',' ')} {GLYPH.get(r['status'],'?')}"
+              f"{'🪦' if (r['zone'] or '') == 'tombstone' else ''} "
               f"{r['branch']:<9} w={weight(r, now_e):.2f} {r['addr']} {clip(content_of(conn, r['addr'], True), a.width)}"
               + (f"  ({r['factor']})" if r["factor"] else "") + fork)
 
@@ -984,6 +1006,8 @@ def cmd_show(conn, a):
     b = conn.execute("SELECT * FROM blobs WHERE addr=?", (r["addr"],)).fetchone()
     print(f"#{r['id']}  {r['ts_iso']}  {GLYPH.get(r['status'])} {r['status']}")
     print(f"branch={r['branch']} parent={r['parent_id']} type={r['type']} scope={r['scope']}")
+    print(f"分区: {r['zone'] or 'hot'}" + (f"  🪦冷却中({r['purge_reason'] or '无理由'})"
+          if (r["zone"] or "") == "tombstone" else ""))
     print(f"三维: t={short_date(r['t'])}  outcome={r['outcome']:+.2f}  语义维={r['v_text'] and len(r['v_text'])//4}")
     print(f"权重: {weight(r, now_e):.3f}  (refs={r['refs']})")
     print(f"地址: {r['addr']}  正文: {'在热库' if b and b['hot']==1 else ('已转冷' if b else '已清除')}")
@@ -1013,23 +1037,80 @@ def cmd_verify(conn, a):
 
 
 def cmd_purge(conn, a):
-    """物理删除：正文从 blobs 移除，节点只留地址（悬空指针），不可恢复。"""
-    if a.addr:
-        held = conn.execute("SELECT COUNT(*) c FROM nodes WHERE pinned=1 AND addr LIKE ?",
-                            (a.addr + "%",)).fetchone()["c"]
-        if held:
-            sys.exit(f"[memtree] 拒绝 purge：{held} 个打保护位的节点引用该地址（先 pin <id> --off）")
-        cur = conn.execute("UPDATE blobs SET hot=2, content='' WHERE addr LIKE ?", (a.addr + "%",))
+    """两段式删除（SPEC §5.5）：先进墓碑区冷却，冷却期满才真删。
+
+    旧实现一按就烧：地址还在、正文没了，不可恢复。删除是不可逆的决定，
+    不可逆的决定必须留一段缓冲 —— 「手滑」和「确实要删」在这几天里会长得不一样。
+    冷却期同时是撤回入口（--restore）；隐私/错误信息仍可 --now 立即删。
+    """
+    now_e = datetime.now().timestamp()
+    if a.restore:
+        r = node(conn, a.restore)
+        if (r["zone"] or "hot") != "tombstone":
+            sys.exit(f"[memtree] #{a.restore} 不在墓碑区，无需撤回")
+        age = max(0.0, now_e - r["t"]) / 86400.0
+        conn.execute("UPDATE nodes SET zone=?, tombstoned_at=NULL, purge_reason=NULL WHERE id=?",
+                     (zone_target(age, r["importance"], r["pinned"], r["label"]), a.restore))
         conn.commit()
-        emit(conn, {"purged_addr": a.addr, "rows": cur.rowcount})
+        emit(conn, {"restored": a.restore,
+                    "note": "冷却期内撤回：正文从未删除，分区按时间重算"})
         return
-    rows = conn.execute("SELECT addr FROM nodes WHERE status IN ('superseded','archived')"
-                        " AND pinned=0").fetchall()
+    if a.list:
+        items = []
+        for r in conn.execute("SELECT id,t,tombstoned_at,purge_reason,subject FROM nodes"
+                              " WHERE zone='tombstone' ORDER BY tombstoned_at").fetchall():
+            left = PURGE_COOLDOWN_DAYS - (now_e - (r["tombstoned_at"] or now_e)) / 86400.0
+            items.append({"id": r["id"], "subject": r["subject"], "reason": r["purge_reason"],
+                          "days_left": round(max(0.0, left), 2), "due": left <= 0})
+        emit(conn, {"tombstones": len(items), "items": items,
+                    "note": "冷却期内 purge --restore <id> 可撤回；到期由 purge --apply 真删"})
+        return
+    if a.apply:
+        due = [r for r in conn.execute("SELECT id,addr,tombstoned_at FROM nodes"
+                                       " WHERE zone='tombstone'").fetchall()
+               if (now_e - (r["tombstoned_at"] or now_e)) / 86400.0 >= PURGE_COOLDOWN_DAYS]
+        n = 0
+        for r in due:
+            n += conn.execute("UPDATE blobs SET hot=2, content='' WHERE addr=? AND hot!=2",
+                              (r["addr"],)).rowcount
+        conn.commit()
+        waiting = conn.execute("SELECT COUNT(*) c FROM nodes WHERE zone='tombstone'").fetchone()["c"]
+        emit(conn, {"purged": n, "due": len(due), "still_waiting": waiting - len(due),
+                    "note": "冷却期满才真删：正文清除，只留悬空地址"})
+        return
+
+    # 进墓碑区：--addr 指定一条；否则整批（已覆盖/归档、无保护位、非锚点）
+    if a.addr:
+        rows = conn.execute("SELECT id,addr,pinned,type,status,zone FROM nodes WHERE addr LIKE ?",
+                            (a.addr + "%",)).fetchall()
+        if not rows:
+            sys.exit(f"[memtree] 没有节点引用地址 {a.addr}")
+        held = [r for r in rows if r["pinned"] or r["type"] == ANCHOR]
+        if held:
+            sys.exit(f"[memtree] 拒绝 purge：#{held[0]['id']} 打保护位或是锚点 —— "
+                     "保护位永不硬删（SPEC §3.1）；确需删除先 pin <id> --off")
+    else:
+        rows = conn.execute("SELECT id,addr FROM nodes WHERE status IN ('superseded','archived')"
+                            " AND pinned=0 AND type!=? AND zone!='tombstone'",
+                            (ANCHOR,)).fetchall()
+    if not rows:
+        emit(conn, {"tombstoned": 0, "note": "没有可删的候选"})
+        return
     n = 0
     for r in rows:
-        n += conn.execute("UPDATE blobs SET hot=2, content='' WHERE addr=? AND hot!=2", (r["addr"],)).rowcount
+        conn.execute("UPDATE nodes SET zone='tombstone', tombstoned_at=?, purge_reason=? WHERE id=?",
+                     (now_e, a.reason, r["id"]))
+        if a.now:   # 隐私/错误信息：跳过冷却，立刻生效
+            n += conn.execute("UPDATE blobs SET hot=2, content='' WHERE addr=? AND hot!=2",
+                              (r["addr"],)).rowcount
     conn.commit()
-    emit(conn, {"purged": n, "note": "已覆盖/归档记忆的正文已物理删除，仅保留地址"})
+    if a.now:
+        emit(conn, {"purged_now": n, "reason": a.reason, "cooldown_skipped": True,
+                    "note": "立即删除：隐私/错误信息不需要冷却，删除不可恢复"})
+        return
+    emit(conn, {"tombstoned": len(rows), "cooldown_days": PURGE_COOLDOWN_DAYS,
+                "due_at": datetime.fromtimestamp(now_e + PURGE_COOLDOWN_DAYS * 86400).strftime("%Y-%m-%d"),
+                "note": "正文仍在库、已从检索与上下文消失；冷却期内 purge --restore <id> 撤回"})
 
 
 # ------------------------------------------------------------------ 图
@@ -1172,6 +1253,11 @@ def cmd_zone(conn, a):
             sys.exit(f"[memtree] 未知分区: {a.set}（可选 {chr(47).join(ZONES)}）")
         r = node(conn, a.id)
         cur = r["zone"] or "hot"
+        if a.set == "tombstone":
+            sys.exit("[memtree] 墓碑区只能由 purge 进入（删除需要理由与冷却），不能用 zone --set")
+        if cur == "tombstone":
+            sys.exit(f"[memtree] #{a.id} 已在墓碑区（已受理删除）：要用 purge --restore {a.id} 撤回，"
+                     "不能用 zone --set 绕过冷却")
         conn.execute("UPDATE nodes SET zone=? WHERE id=?", (a.set, a.id))
         conn.commit()
         emit(conn, {"id": a.id, "from": cur, "to": a.set, "explicit": True,
@@ -1180,6 +1266,8 @@ def cmd_zone(conn, a):
     if a.migrate:
         moved, blocked = [], 0
         for r in conn.execute("SELECT id,t,zone,importance,pinned,label FROM nodes").fetchall():
+            if (r["zone"] or "hot") == "tombstone":   # 墓碑区不参与时间迁移：它是删除流程，不是老化
+                continue
             age = max(0.0, now_e - r["t"]) / 86400.0
             tgt = zone_target(age, r["importance"], r["pinned"], r["label"])
             cur = r["zone"] or "hot"
@@ -1232,9 +1320,14 @@ def cmd_stats(conn, a):
                      for r in g("SELECT label,COUNT(*) c FROM nodes GROUP BY label")},
         "by_zone": {r["zone"] or "hot": r["c"]
                     for r in g("SELECT zone,COUNT(*) c FROM nodes GROUP BY zone")},
+        "tombstone": {"pending": g("SELECT COUNT(*) c FROM nodes WHERE zone='tombstone'")[0]["c"],
+                      "due": g("SELECT COUNT(*) c FROM nodes WHERE zone='tombstone'"
+                               " AND tombstoned_at IS NOT NULL"
+                               f" AND tombstoned_at <= {datetime.now().timestamp() - PURGE_COOLDOWN_DAYS * 86400}")[0]["c"]},
         "pending_signals": g("SELECT COUNT(*) c FROM signals WHERE settled=0")[0]["c"],
         "vec_dims": VEC_D,
-        "note": "热度只用于触发压缩（§4.1），不参与排序；分区只随时间单向降级、升级须显式；锚点/保护位不压缩、不裁剪、不硬删",
+        "note": "热度只用于触发压缩（§4.1），不参与排序；分区只随时间单向降级、升级须显式；"
+                f"硬删除两段式（墓碑区冷却 {PURGE_COOLDOWN_DAYS:g} 天）；锚点/保护位不压缩、不裁剪、不硬删",
     })
 
 
@@ -1328,7 +1421,7 @@ def main(argv=None):
     s.add_argument("--outcome", type=float, help="期望结果值 [-1,1]")
     s.add_argument("--days", type=float, help="时间窗：只要 ±N 天内")
     s.add_argument("--event", help="只在此事件内检索（先剪枝，再算相似度）")
-    s.add_argument("--zone", help="只看这些分区：hot,warm,cold,archive（逗号分隔）")
+    s.add_argument("--zone", help="只看这些分区：hot,warm,cold,archive,tombstone（逗号分隔）")
     s.add_argument("--mode", default="and", choices=["and", "mix"],
                    help="and=内积定位（默认），mix=语义优先（时间只做微调）")
     s.add_argument("--branch"); s.add_argument("--top", type=int, default=5)
@@ -1346,8 +1439,13 @@ def main(argv=None):
     s = add("verify", cmd_verify, "按地址校验正文完整性")
     s.add_argument("addr"); s.add_argument("--show", action="store_true")
 
-    s = add("purge", cmd_purge, "物理删除已覆盖记忆的正文，只留地址")
-    s.add_argument("--addr")
+    s = add("purge", cmd_purge, "两段式删除：先进墓碑区冷却 7 天，期满才真删")
+    s.add_argument("--addr", help="按地址进墓碑区（不填=整批已覆盖/归档且无保护位的）")
+    s.add_argument("--apply", action="store_true", help="冷却期满的真删（唯一不可逆入口）")
+    s.add_argument("--list", action="store_true", help="看墓碑区排队情况与剩余天数")
+    s.add_argument("--restore", type=int, metavar="ID", help="冷却期内撤回一条（正文没删过）")
+    s.add_argument("--now", action="store_true", help="跳过冷却立即删：隐私/错误信息")
+    s.add_argument("--reason", help="删除理由（隐私/错误/用户要求）——记进审计，删完也留着")
 
     s = add("zone", cmd_zone, "分区：看分布 / 单向降级 / 显式升级")
     s.add_argument("id", type=int, nargs="?")

@@ -71,6 +71,7 @@ addr = sha256(content)[:16]
 | `active` | `blobs.hot=1` | 能，进上下文 |
 | `superseded` / `archived` | `blobs.hot=0` | 能（`verify`/`show`），不进检索 |
 | `purged` | `hot=2`，正文清空 | 不能，地址成为悬空指针，仅作溯源 |
+| `tombstone`（墓碑区） | 已受理删除、冷却中；正文还在但检索/上下文都看不到 | 能：`purge --restore <id>` 撤回（正文从未删过） |
 
 相同内容天然去重。`verify <addr>` 重算 sha256 比对 —— 地址即内容，篡改必被发现。
 
@@ -229,7 +230,8 @@ $M graph --style git              # 输出 Mermaid 图
 | `signal` / `settle` | 采样入队 / 一次性结算成 label（带审计） |
 | `label` / `pin` | 手动打标签 / 保护位开关 |
 | `zone` | 分区：看分布 / `--migrate` 单向降级 / `--id <n> --set hot` 显式升级 |
-| `compress` / `purge` | 旧事件压缩 / 正文物理删除 |
+| `compress` | 旧事件压缩成摘要 |
+| `purge` | 两段式删除：默认进墓碑区冷却 `7天` → `--apply` 期满真删；`--now` 隐私立删；`--list` / `--restore <id>` / `--reason` |
 | `graph` / `stats` / `export` | 出图 / 统计 / 导出 |
 
 DB 默认 `./.workbuddy/memory/memtree.db`，用 `MEMTREE_DB` 覆盖（按项目分库）。
@@ -274,7 +276,7 @@ bash scripts/selftest.sh
 [13] 硬锚点（不被现状吞掉）          ok ×3
 [14] 非 ASCII（emoji/假名）           ok ×2
 [15] 热度只做压缩计时器              ok ×3
-通过 75 / 失败 0
+通过 94 / 失败 0
 ```
 
 ---
@@ -295,7 +297,7 @@ memory-timeline/
 │   └── prompts.md        # 注入模板与抽取提示词
 └── scripts/
     ├── memtree.py        # 全部实现，单文件，零依赖
-    └── selftest.sh       # 75 项自检
+    └── selftest.sh       # 94 项自检
 ```
 
 ---

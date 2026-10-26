@@ -86,9 +86,10 @@ $M compress --days 40 --min-count 3 >/dev/null
 chk "生成 summary" "c.execute(\"select count(*) from nodes where type='summary'\").fetchone()[0]==1"
 chk "旧事件不再 active" "c.execute(\"select count(*) from nodes where status='active' and addr in (select addr from blobs where content like '旧事件%')\").fetchone()[0]==0"
 
-echo "[8] 物理清除"
+echo "[8] 物理清除（两段式：批量 purge 先进墓碑区）"
 $M purge >/dev/null
-chk "被覆盖正文已物理删除" "c.execute(\"select count(*) from blobs where hot=2 and content=''\").fetchone()[0]>=1"
+chk "整批 purge 只进墓碑区，正文还在（有冷却期）" "c.execute(\"select count(*) from nodes where zone='tombstone'\").fetchone()[0]>=1 and c.execute(\"select count(*) from blobs where hot=2\").fetchone()[0]==0"
+chk "墓碑区的正文仍可读（撤回时用得上）" "c.execute(\"select count(*) from nodes n join blobs b on n.addr=b.addr where n.zone='tombstone' and length(b.content)>0\").fetchone()[0]>=1"
 
 echo "[9] 出图"
 $M graph | grep -q "gitGraph" && { PASS=$((PASS+1)); echo "  ok   git 图"; } || { FAIL=$((FAIL+1)); echo "  FAIL git 图"; }
@@ -247,6 +248,61 @@ EOF
 $M context --budget 3000 >/dev/null 2>&1 && { PASS=$((PASS+1)); echo "  ok   缺 zone 列的老库能打开"; } || { FAIL=$((FAIL+1)); echo "  FAIL 老库缺 zone 直接报错"; }
 chk "zone 列已补回" "\"zone\" in [r[1] for r in c.execute(\"PRAGMA table_info(nodes)\")]"
 chk "补列后不是全 hot（已按时间回填）" "c.execute(\"select count(*) from nodes where zone!='hot'\").fetchone()[0]>0"
+echo "[23] 墓碑区：删除两段式（墓碑 → 冷却 → 真删）"
+TBSEC=$($M commit "临时密码是 9999" --type event --subject tb.secret -q | tail -1)
+TBADDR=$("$PY" - "$MEMTREE_DB" "$TBSEC" <<'EOF'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+print(c.execute("select addr from nodes where id=?", (int(sys.argv[2]),)).fetchone()[0])
+EOF
+)
+$M purge --addr "$TBADDR" --reason 隐私 >/dev/null
+chk "进墓碑区：zone=tombstone 且正文还在（没删）" "c.execute(\"select n.zone,b.hot,length(b.content) from nodes n join blobs b on n.addr=b.addr where n.id=$TBSEC\").fetchone()[:2]==('tombstone',1)"
+chk "墓碑有冷却到期时间戳" "c.execute(\"select tombstoned_at from nodes where id=$TBSEC\").fetchone()[0] is not None"
+chk "删除理由被记下（删完也能审计）" "c.execute(\"select purge_reason from nodes where id=$TBSEC\").fetchone()[0]=='隐私'"
+TCTX=$($M context --budget 3000)
+echo "$TCTX" | grep -q "9999" && { FAIL=$((FAIL+1)); echo "  FAIL 墓碑正文泄漏进上下文"; } || { PASS=$((PASS+1)); echo "  ok   墓碑区不进上下文"; }
+echo "$TCTX" | grep -q "墓碑区 .* 条已受理删除" && { PASS=$((PASS+1)); echo "  ok   墓碑区条数必须明说"; } || { FAIL=$((FAIL+1)); echo "  FAIL 墓碑区被静默隐藏"; }
+echo "$TCTX" | grep -q "未加载 -" && { FAIL=$((FAIL+1)); echo "  FAIL 冷区计数算成负数"; } || { PASS=$((PASS+1)); echo "  ok   冷区计数不为负（墓碑与冷区分开算）"; }
+$M recall "临时密码" --json | grep -q '"zone": "tombstone"' && { FAIL=$((FAIL+1)); echo "  FAIL 墓碑默认还能被检索到"; } || { PASS=$((PASS+1)); echo "  ok   墓碑默认检索不到"; }
+$M recall "临时密码" --zone tombstone --json | grep -q '"zone": "tombstone"' && { PASS=$((PASS+1)); echo "  ok   recall --zone tombstone 显式可查"; } || { FAIL=$((FAIL+1)); echo "  FAIL 墓碑区查不到"; }
+$M purge --list | grep -q '"days_left"' && { PASS=$((PASS+1)); echo "  ok   purge --list 报剩余冷却天数"; } || { FAIL=$((FAIL+1)); echo "  FAIL --list 缺 days_left"; }
+TAP=$($M purge --apply)
+echo "$TAP" | grep -q '"due": 0' && { PASS=$((PASS+1)); echo "  ok   冷却未满不真删"; } || { FAIL=$((FAIL+1)); echo "  FAIL 冷却期被跳过"; }
+chk "冷却未满正文仍在" "c.execute(\"select length(b.content) from nodes n join blobs b on n.addr=b.addr where n.id=$TBSEC\").fetchone()[0]>0"
+$M purge --restore $TBSEC >/dev/null
+chk "冷却期内可撤回，分区按时间重算（回 hot）" "c.execute(\"select zone from nodes where id=$TBSEC\").fetchone()[0]=='hot'"
+TBPIN=$("$PY" - "$MEMTREE_DB" <<'EOF'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+print(c.execute("select addr from nodes where pinned=1 limit 1").fetchone()[0])
+EOF
+)
+$M purge --addr "$TBPIN" >/dev/null 2>&1; [ $? -ne 0 ] && { PASS=$((PASS+1)); echo "  ok   保护位拒绝 purge"; } || { FAIL=$((FAIL+1)); echo "  FAIL 保护位被硬删了"; }
+$M zone $TBSEC --set tombstone >/dev/null 2>&1; [ $? -ne 0 ] && { PASS=$((PASS+1)); echo "  ok   墓碑区不能用 zone --set 进入"; } || { FAIL=$((FAIL+1)); echo "  FAIL 绕过 purge 进了墓碑区"; }
+$M purge --addr "$TBADDR" --reason 隐私 >/dev/null
+"$PY" - "$MEMTREE_DB" "$TBSEC" <<'EOF'
+import sqlite3, sys, time
+c = sqlite3.connect(sys.argv[1])
+c.execute("update nodes set tombstoned_at=? where id=?", (time.time() - 8 * 86400, int(sys.argv[2])))
+c.commit()
+EOF
+$M zone --migrate >/dev/null
+chk "时间迁移不动墓碑（删除流程不是老化）" "c.execute(\"select zone from nodes where id=$TBSEC\").fetchone()[0]=='tombstone'"
+$M purge --apply >/dev/null
+chk "冷却期满 → 真删：正文清空、只留悬空地址" "c.execute(\"select b.hot,b.content from nodes n join blobs b on n.addr=b.addr where n.id=$TBSEC\").fetchone()[:2]==(2,'')"
+TBNOW=$($M commit "错误信息：不该留的" --type fact --subject tb.err -q | tail -1)
+$M purge --addr "$TBADDR" --now --reason 隐私 >/dev/null   # addr 已清空 → 无候选，不该删别人
+TBN2=$("$PY" - "$MEMTREE_DB" "$TBNOW" <<'EOF'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+print(c.execute("select addr from nodes where id=?", (int(sys.argv[2]),)).fetchone()[0])
+EOF
+)
+$M purge --addr "$TBN2" --now --reason 隐私 >/dev/null
+chk "--now 跳过冷却，立即真删（隐私没有缓冲期）" "c.execute(\"select b.hot from nodes n join blobs b on n.addr=b.addr where n.id=$TBNOW\").fetchone()[0]==2"
+chk "stats 报墓碑待删/到期数" "c.execute(\"select count(*) from nodes where zone='tombstone'\").fetchone()[0]>=2"
+
 echo
 echo "通过 $PASS / 失败 $FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

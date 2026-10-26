@@ -2,7 +2,7 @@
 
 > 审计对象：本项目（v2.1，单 commit **fcddaa6**）在 2026-10 本轮改版后的状态。
 > 验收标准：那份 12 节设计 SPEC（时间+事件二维图、五档分区、遗忘流水线、人格卡与三层锚点、情感层、上下文组装、落地选型、三条铁律、8 个待定参数）。
-> 证据行号全部指向 `scripts/memtree.py`（改动后 900+ 行）。自检 `bash scripts/selftest.sh` → **通过 75 / 失败 0**。
+> 证据行号全部指向 `scripts/memtree.py`（改动后 900+ 行）。自检 `bash scripts/selftest.sh` → **通过 94 / 失败 0**。
 
 ## 一句话结论
 
@@ -21,7 +21,7 @@
 | §2.1 时间轴第一索引 | **已实现** | 写入、上下文边界、检索、压缩全部按 `t` | — |
 | §2.2 事件聚合节点 | **部分**（本轮落地最小版） | `nodes.event` 受控短标签（≤24 字，超长直接拒写）；`context` 事件轴段 `▣ 名 起~止 n条` 即跨期时间区间；现状行尾 `⟦名⟧`；`recall --event` 在分支过滤之后、算相似度之前剪枝（先剪枝后相似度） | 事件边界仍由外部 Agent 给（未做会话分段）；没有独立事件节点/事件级权重；同类型事件的秩位衰减未做 |
 | §2.3 三档时间权重 | **部分** | 过去衰减 `0.5^(abs(dt)/45d)`（:80 区域）、时间窗 `--days`、未来对称衰减 | 未来「越临近越高、过期转历史」是用 `abs()` 近似出来的，不是独立方向项；同类型事件的秩位衰减完全没有 |
-| §3 五档分区 | **未实现** | 只有 `blobs.hot` 0/1/2 与 `status`；`stats` 给出 hot/warm/cold 热度分布（:937） | 热/温/冷保护区/压缩归档/墓碑区不是真分区，没有区域迁移，没有墓碑冷却期 |
+| §3 五档分区 | **已实现** | `nodes.zone`（hot/warm/cold/archive/tombstone）+ `zone_target()` + `zone --migrate` 单向降级；`blobs.hot` 0/1/2 是存储态 | 归档区磁盘配额、分区按分支差异化阈值没做 |
 | §4.1 热度=计时器 | **已实现** | `heat_of()`：只算「距上次访问」，绝不累计次数；`compress --heat` 是唯一消费者 | — |
 | §4.1 动态因子采样（本轮新增） | **已实现** | `signal` 采样 → `settle` 一次性结算 → `label` → `pinned`；`_judge()` 走规则不调 LLM；`settle_log` 留审计 | 情感摘要的 `emotion_tags` 尚未结构化落库（目前只存 `signals.quote`） |
 | §4.2 分类型压缩阈值 | **未实现** | 单一 `--days/--min-count/--heat` | 普通/重要/情感锚点三档阈值 |
@@ -57,13 +57,14 @@
 | 10 | `compress` 默认分支改 HEAD、跳过保护位、`--heat` | :902 | 旧版写死 `main`，在别的分支上压缩静默 0 条 |
 | 11 | 自检 20 → 52 项 | scripts/selftest.sh | 上面每一项都要有回归测试，尤其「未来笔误不霸榜」和「保护位扛住裁剪」 |
 | 13 | **事件层最小版**（SPEC §2.2） | scripts/memtree.py :237 `event` 列 / `_migrate` / `cmd_commit` / `cmd_context` 事件轴 / `cmd_recall --event` | 索引必须等 `_migrate` 补列之后再建——写进 `executescript` 会让老库一打开就报错并整段回滚，升级即崩。自检 [19][20] 专测「事件随正文入上下文」与「缺列老库能平滑升级」 |
+| 15 | **墓碑区 + 两段式删除**（SPEC §3/§5.5） | scripts/memtree.py `cmd_purge()` 重写 / `PURGE_COOLDOWN_DAYS=7.0` / `nodes.tombstoned_at` `purge_reason` / `cmd_zone` 双向拒绝绕过分区接口 / `cmd_context` 墓碑计数与隐藏 / `cmd_recall` 默认排除 / `cmd_stats.tombstone` / `cmd_log` 🪦 标记 | 不可逆的决定必须留缓冲：`purge` 原来一按就烧，地址还在、正文没了。现在默认进墓碑区冷却 7 天，`--apply` 才真删、`--restore` 可撤回。墓碑区**不许**用 `zone --set` 进出——删除要走 purge 的理由与冷却，不能借分区接口绕过 |
 | 14 | **五档分区 `zone` + 单向迁移器**（SPEC §3/§4） | scripts/memtree.py `zone_target()` / `cmd_zone()` / `cmd_commit --importance` / `cmd_context` 分区门 / `cmd_recall --zone` / `cmd_stats.by_zone` / `cmd_compress` 跳过归档 | 分区只由「时间 + 重要度 + 保护位」决定：降级自动、升级必须 `--set`（铁律一/二）。老库补列后立刻按时间回填一次，否则新建列全 hot、单向降级从第一天就不成立。冷/归档被隐藏时必须显式说出条数，不许静默丢状态 |
 | 12 | 文档校准（schema/README/SKILL） | references/schema.md、README.md、SKILL.md | README 的 554 token / 20 项自检已与实现不符；实测 context 358 token；本轮补 `event` 列与 `▣/⟦⟧` 图例 |
 
 ## 明确没做（别误以为有）
 
 - **事件层只有最小版**：`nodes.event` 是受控短标签 + 时间区间聚合，能回答「这三个月围绕哪几件事」，但没有独立事件节点、没有事件级权重、事件边界仍靠外部 Agent 给（会话分段未做）。`subject` 仍然是「谁和谁比」的分组键，别当事件用。
-- **分区只做了前四档**：`zone` 列 + `zone --migrate` 单向降级（hot≤7d → warm 7~90d → cold[重要度≥0.7 或保护位] → archive），升级必须 `zone --id <n> --set`。**墓碑区没做**：硬删除仍由 `purge` 直接执行，没有「进墓碑 → 冷却 7 天 → 真删」的两段式。
+- **分区只做了前四档**：`zone` 列 + `zone --migrate` 单向降级（hot≤7d → warm 7~90d → cold[重要度≥0.7 或保护位] → archive），升级必须 `zone --id <n> --set`。**墓碑区已做**：`purge` 改成两段式（进墓碑 → 冷却 7 天 → `--apply` 真删），冷却期内 `--restore` 可撤回、`--now` 给隐私开直通车。
 - **没有情感层**：情绪、强度、金句、关系里程碑都无处可存（里程碑只能塞 `type=anchor`）。
 - **没有自动抽取**：写什么、`subject` 叫什么、摘要写什么，全由外部 Agent 决定。`subject` 的自由生成是本系统唯一的失败入口。
 - **没有 LLM 调用**：这就是零依赖的代价——「零 LLM 成本」对整条链路不成立，每轮仍要外部 Agent 抽一次。
@@ -74,14 +75,14 @@
 
 1. **受控 subject 枚举**：在 SKILL.md 里给出枚举表并让抽取器只能选，不自由生成。这一条的收益大于剩下所有 bug 的总和。
 2. ~~事件层最小版~~（已完成：`event` 列 + 事件轴 + `recall --event` 剪枝）。剩下的：会话分段自动划事件边界、事件级权重、同类型事件秩位衰减。
-3. ~~`zone` 列 + 单向迁移器~~（已完成）。剩下：墓碑区 + 硬删除冷却期、归档区磁盘配额、以及「压缩只压细节」——那需要先有事件内细节梯度。
+3. ~~`zone` 列 + 单向迁移器~~ ~~墓碑区 + 硬删除冷却期~~（均已完成）。剩下：归档区磁盘配额、以及「压缩只压细节」——那需要先有事件内细节梯度。
 4. **情感层独立表**：`affect(ts, emotion_tags, intensity, key_quote, event_id)`，会话内内存、结束时落一条；情感锚点用 `pinned + emotional_anchor` 双标记。
 5. **人格卡**：单独文件 + token 上限 + 变更日志；先把「卡从哪来、谁批准改」定下来，再谈版本化。
 
 ## 怎么复核本文件
 
 ```bash
-bash scripts/selftest.sh          # 期望：通过 75 / 失败 0
+bash scripts/selftest.sh          # 期望：通过 94 / 失败 0
 python scripts/memtree.py context --budget 200   # 期望：末行有「⚠ 还有 N 条未展开」
 python scripts/memtree.py stats                   # 期望：有 protected 与 heat 两段
 ```
