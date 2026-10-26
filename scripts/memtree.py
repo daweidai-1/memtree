@@ -419,6 +419,33 @@ def pinned_refs(conn, addr):
                         (addr,)).fetchone()["c"]
 
 
+def orphan_addrs(conn):
+    """孤儿地址：全库没有任何节点（任何 zone、任何 status）引用的 blob。
+
+    这种正文是纯占用 —— 地址还在、谁也不要了。但墓碑区节点仍算引用者
+    （冷却期内要能 --restore 撤回），所以它不在孤儿之列。
+    """
+    return conn.execute(
+        "SELECT b.addr, b.nbytes FROM blobs b"
+        " WHERE NOT EXISTS (SELECT 1 FROM nodes n WHERE n.addr=b.addr)").fetchall()
+
+
+def _cold_blob(conn, addr):
+    """给地址转冷，但绝不误伤还活着的那条 —— 内容寻址会把正文一字不差的两条并成一个地址。
+
+    审计实证的 bug：覆盖时对败者的 addr 盲目标 hot=0，若胜者与它共用同一地址，
+    活着的胜者读自己的正文就成了「[地址 … 已转冷]」。静默把正文变成占位符是
+    本项目最贵的一类 bug，所以转冷前必须问一句：这地址上还有现状类节点吗？
+    有 → 不转冷（宁可多占一点热区，也不许让活条目读不到自己的正文）。
+    """
+    alive = conn.execute(
+        "SELECT COUNT(*) c FROM nodes WHERE addr=? AND status IN ('active','competing')"
+        " AND (zone IS NULL OR zone<>'tombstone')", (addr,)).fetchone()["c"]
+    if alive:
+        return 0
+    return conn.execute("UPDATE blobs SET hot=0 WHERE addr=? AND hot=1", (addr,)).rowcount
+
+
 def emit(conn, obj, quiet=False):
     if not quiet:
         print(json.dumps(obj, ensure_ascii=False))
@@ -496,7 +523,7 @@ def cmd_commit(conn, a):
                 # 只有记下覆盖发生的时刻才算得出来（当前 status 只知道结果，不知道时刻）。
                 conn.execute("""UPDATE nodes SET status='superseded', superseded_by=?, gone_at=?
                                 WHERE id=?""", (win["id"], win["t"], r["id"]))
-                conn.execute("UPDATE blobs SET hot=0 WHERE addr=?", (r["addr"],))
+                _cold_blob(conn, r["addr"])
             decision = "supersede" if win["id"] == nid else "kept"
             rival = {"id": loser["id"], "w_lost": round(weight(loser), 3),
                      "w_win": round(weight(win), 3)}
@@ -514,7 +541,7 @@ def cmd_commit(conn, a):
                ORDER BY t DESC, id DESC""", (subject, ANCHOR, nid)):
             conn.execute("""UPDATE nodes SET status='superseded', superseded_by=?, gone_at=?
                             WHERE id=?""", (nid, t_epoch, r["id"]))
-            conn.execute("UPDATE blobs SET hot=0 WHERE addr=?", (r["addr"],))
+            _cold_blob(conn, r["addr"])
         decision = "anchor-replace"
     elif ntype in STATEFUL and subject:
         anc = conn.execute(
@@ -718,7 +745,7 @@ def cmd_merge(conn, a):
     conn.execute("""UPDATE nodes SET status='archived', gone_at=?
                     WHERE branch=? AND status IN ('active','competing')""", (t_e, a.name))
     for r in conn.execute("SELECT addr FROM nodes WHERE branch=? AND status='archived'", (a.name,)):
-        conn.execute("UPDATE blobs SET hot=0 WHERE addr=?", (r["addr"],))
+        _cold_blob(conn, r["addr"])
     conn.commit()
     emit(conn, {"merge_node": nid, "branch": a.name, "into": a.into, "archived": True})
 
@@ -1176,6 +1203,28 @@ def cmd_purge(conn, a):
     冷却期同时是撤回入口（--restore）；隐私/错误信息仍可 --now 立即删。
     """
     now_e = datetime.now().timestamp()
+    if a.gc:
+        # 显式 GC：只回收「全库无人引用」的孤儿正文，只动 blobs 表，不删任何 nodes 行。
+        # 不做自动触发 —— 回收是省空间的手段，删除是不可逆的决定，不可逆的事必须有人按。
+        orph = orphan_addrs(conn)
+        total = sum(r["nbytes"] or 0 for r in orph)
+        out = {"gc_removed": 0, "bytes": total,
+               "note": "只回收全库无人引用的孤儿正文；墓碑节点仍算引用者，冷却期内不会误删"}
+        if a.dry_run:
+            out["dry_run"] = True
+            out["would_remove"] = len(orph)
+        else:
+            for r in orph:
+                conn.execute("DELETE FROM blobs WHERE addr=?", (r["addr"],))
+            conn.commit()
+            out["gc_removed"] = len(orph)
+        ignored = [k for k in ("apply", "now", "addr", "restore", "list")
+                   if getattr(a, k, None)]
+        if ignored:
+            out["ignored"] = ignored
+            out["note"] += "；--gc 独占本次调用，其余删除参数本次不生效"
+        emit(conn, out)
+        return
     if a.restore:
         r = node(conn, a.restore)
         if (r["zone"] or "hot") != "tombstone":
@@ -1439,7 +1488,7 @@ def cmd_compress(conn, a):
         for r in to_zip:
             conn.execute("""UPDATE nodes SET status='archived', rolled_into=?, gone_at=?
                             WHERE id=?""", (sid, t_now, r["id"]))
-            conn.execute("UPDATE blobs SET hot=0 WHERE addr=?", (r["addr"],))
+            _cold_blob(conn, r["addr"])
         done.append({"event": key, "summary_node": sid, "compressed": len(to_zip),
                      "span": span, "text": body,
                      "kept_detail": sorted(kept_ids) if keep_n else []})
@@ -1512,6 +1561,7 @@ def _heat_hist(conn):
 
 def cmd_stats(conn, a):
     g = lambda q: conn.execute(q).fetchall()
+    orph = orphan_addrs(conn)      # 孤儿正文：不用跑 GC 也能知道有多少可回收
     emit(conn, {
         "db": db_path(a),
         "nodes": g("SELECT COUNT(*) c FROM nodes")[0]["c"],
@@ -1519,7 +1569,9 @@ def cmd_stats(conn, a):
         "by_type": {r["type"]: r["c"] for r in g("SELECT type,COUNT(*) c FROM nodes GROUP BY type")},
         "blobs": {"hot": g("SELECT COUNT(*) c FROM blobs WHERE hot=1")[0]["c"],
                   "cold": g("SELECT COUNT(*) c FROM blobs WHERE hot=0")[0]["c"],
-                  "purged": g("SELECT COUNT(*) c FROM blobs WHERE hot=2")[0]["c"]},
+                  "purged": g("SELECT COUNT(*) c FROM blobs WHERE hot=2")[0]["c"],
+                  "orphans": len(orph),
+                  "orphan_bytes": sum(r["nbytes"] or 0 for r in orph)},
         "protected": {"pinned": g("SELECT COUNT(*) c FROM nodes WHERE pinned=1")[0]["c"],
                       "anchor": g("SELECT COUNT(*) c FROM nodes WHERE type='anchor'"
                                   " AND status='active'")[0]["c"]},
@@ -1653,6 +1705,9 @@ def main(argv=None):
     s.add_argument("--list", action="store_true", help="看墓碑区排队情况与剩余天数")
     s.add_argument("--restore", type=int, metavar="ID", help="冷却期内撤回一条（正文没删过）")
     s.add_argument("--now", action="store_true", help="跳过冷却立即删：隐私/错误信息")
+    s.add_argument("--gc", action="store_true",
+                   help="显式回收全库无人引用的孤儿正文（只动 blobs 表，不删节点）")
+    s.add_argument("--dry-run", action="store_true", help="配合 --gc：只报可回收数，不删")
     s.add_argument("--reason", help="删除理由（隐私/错误/用户要求）——记进审计，删完也留着")
 
     s = add("zone", cmd_zone, "分区：看分布 / 单向降级 / 显式升级")
