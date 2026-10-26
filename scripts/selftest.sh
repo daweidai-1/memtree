@@ -1275,6 +1275,31 @@ c.commit()
 EOF
 $M context --budget 500 >/dev/null 2>&1
 chk "F4：老库 tombstone+hot=2 幽灵由 _migrate 平滑转为 purged" "c.execute(\"select zone from nodes where id=$F4N\").fetchone()[0]=='purged'"
+# F5：restore 两条路径必须分开：正文已抹的拒绝，冷却中的成功。
+F4STATUS=$("$PY" - "$MEMTREE_DB" "$F4N" <<'EOF'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+print(c.execute("select status from nodes where id=?", (int(sys.argv[2]),)).fetchone()[0])
+EOF
+)
+$M purge --restore "$F4N" >"$TF34/f5_dead.txt" 2>&1; F5DEADRC=$?
+chk "F5：已 apply 的节点 restore 退出码非 0" "'$F5DEADRC'!='0'"
+echo "$(cat "$TF34/f5_dead.txt")" | grep -q "正文已永久删除，无法撤回" && { PASS=$((PASS+1)); echo "  ok   F5：拒绝文案明确说正文永久删除"; } || { FAIL=$((FAIL+1)); echo "  FAIL F5：拒绝文案不对"; }
+chk "F5：拒绝 restore 后 zone/status 都不变" "c.execute(\"select zone,status from nodes where id=$F4N\").fetchone()[:2]==('purged','$F4STATUS')"
+$M recall "F4 待真删" --status any --json >"$TF34/f5_dead_recall.json"
+ochk "F5：拒绝 restore 后 recall 仍不命中" "$TF34/f5_dead_recall.json" "$F4N not in [h['id'] for h in json.loads(out)['hits']]"
+F5R=$($M commit "F5 冷却期可撤回" --type fact --subject f5.back -q)
+F5RADDR=$("$PY" - "$MEMTREE_DB" "$F5R" <<'EOF'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+print(c.execute("select addr from nodes where id=?", (int(sys.argv[2]),)).fetchone()[0])
+EOF
+)
+$M purge --addr "$F5RADDR" --reason 常规清理 >/dev/null
+$M purge --restore "$F5R" >"$TF34/f5_ok.json"
+ochk "F5：冷却期 restore 成功且文案保留『冷却期内撤回』" "$TF34/f5_ok.json" "json.loads(out)['restored']==$F5R and '冷却期内撤回' in json.loads(out)['note']"
+$M recall "F5 冷却期可撤回" --json >"$TF34/f5_ok_recall.json"
+ochk "F5：冷却期 restore 后能正常检索到" "$TF34/f5_ok_recall.json" "$F5R in [h['id'] for h in json.loads(out)['hits']]"
 
 echo "通过 $PASS / 失败 $FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

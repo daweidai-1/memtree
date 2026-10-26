@@ -1916,6 +1916,11 @@ def cmd_purge(conn, a):
         return
     if a.restore:
         r = node(conn, a.restore)
+        b = conn.execute("SELECT hot,content FROM blobs WHERE addr=?", (r["addr"],)).fetchone()
+        # 正文一旦被抹，撤回就不存在了。先判正文，再判 zone：
+        # 老库里的幽灵可能 zone 还没结案，但 hot=2 已经是永久删除。
+        if (r["zone"] or "hot") == "purged" or not b or b["hot"] == 2 or not b["content"]:
+            sys.exit(f"[memtree] #{a.restore} 正文已永久删除，无法撤回")
         if (r["zone"] or "hot") != "tombstone":
             sys.exit(f"[memtree] #{a.restore} 不在墓碑区，无需撤回")
         age = max(0.0, now_e - r["t"]) / 86400.0
