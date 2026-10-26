@@ -5,7 +5,7 @@
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Deps](https://img.shields.io/badge/dependencies-0-brightgreen)]()
-[![Self-test](https://img.shields.io/badge/self--test-211%2F211-success)]()
+[![Self-test](https://img.shields.io/badge/self--test-292%2F292-success)]()
 
 > A timeline-first memory layer for AI agents. Old state is superseded by time, not by an LLM vote. 530 bytes per memory, ~360 tokens per turn, zero dependencies.
 
@@ -242,6 +242,14 @@ $M graph --style git              # 输出 Mermaid 图
 - **未来条目单独一段**：`⏳ 未来 N 条尚未发生（不参与现状判定）`。它们不进 `■` 现状、不许把真实现状顶掉；被未来条目覆盖的现状按 `gone_at > now` 补回并标 `(覆盖者在未来·此刻仍是现状)`，正文强制读原文。`context --json` 的 `total` 里多一个 `future`。
 - **未来条目不免疫压缩**：热度按 `max(accessed_at, min(t, now))` 算（否则 2030 年的一处笔误永久热度 1.0、永远压不动），`--keep-detail` 的「最新」也只认**已发生**的最新。
 
+### 人格卡：三槽预算，改硬槽要 --force
+
+- 人格卡是**独立文件**（默认 `<库路径>.persona.md`，`--persona-file` 覆盖），三段固定标题 `## 硬槽` / `## 软槽` / `## 可变槽`，一行一条 `- `。它**不进 `nodes`**，`--type anchor` 的语义没变 —— 卡说"我是谁"，节点说"发生过什么"。
+- 预算按 `est_tokens`（中文 1 字≈1.5 token）：硬 ≤300 / 软 ≤350 / 可变 ≤150，整卡 ≤800 兜底。**硬槽超预算直接拒写**（不挤别人）；软/可变超预算按最旧优先挤出并留 `op=evict`；挤到只剩新条目仍超 → 整条回滚、`exit 2`。
+- **硬槽 `set` / `drop` 都必须 `--force`**：人格漂移和记忆覆盖不同，它不会自己回滚；删除同样可能绕过防漂移护栏。被拒时卡文件与日志都不动。
+- 卡是"现在是什么"，`persona_log`（`op ∈ add|del|evict`）是"改过什么"；`persona show --at T` 正向重放到那一刻（T 早于首次写入 → `(卡为空)`）。
+- 卡非空时 `context` 在首行之后、锚点之前多三行 `⚓人格·硬 / ⚓人格·软 / ⚓人格·可变`（只出非空槽），计入 `--budget` 但**永不被裁**；卡为空时输出与没有人格卡逐字相同，`context --json` 增 `persona` 三槽 + `est_tokens`。
+
 ### 命令速查
 
 | 命令 | 作用 |
@@ -254,6 +262,7 @@ $M graph --style git              # 输出 Mermaid 图
 | `branch` / `checkout` / `merge` | 分叉 / 切换 / 合并归档 |
 | `signal` / `settle` | 采样入队 / 一次性结算成 label（带审计） |
 | `label` / `pin` | 手动打标签 / 保护位开关 |
+| `persona` | 人格卡：`show [--json] [--at T]` / `set "…" --slot hard\|soft\|var [--force] [--reason]` / `drop "…" --slot … [--force]` / `log [--limit N] [--json]`（硬槽 `set`/`drop` 都要 `--force`，超预算按最旧挤出） |
 | `zone` | 分区：看分布 / `--migrate` 单向降级 / `--id <n> --set hot` 显式升级 |
 | `compress` | 事件内细节梯度：`--days 30 --before --min-count 3 --keep-detail 1 --heat --text --branch`；越新越细、结论必留 |
 | `purge` | 两段式删除：默认进墓碑区冷却 `7天` → `--apply` 期满真删；`--now` 隐私立删；`--list` / `--restore <id>` / `--reason` / `--addr` / `--gc [--dry-run]`（回收孤儿正文） |
@@ -283,7 +292,7 @@ DB 默认 `./.workbuddy/memory/memtree.db`，用 `MEMTREE_DB` 覆盖（按项目
 bash scripts/selftest.sh
 ```
 
-211 项（27 组），覆盖：时间覆盖 / 乱序补录 / 三维检索 / 内容寻址 / 分支 / context 预算 / 压缩 / 压缩梯度（`--keep-detail` 与结论必留）/ 物理清除 / 出图 / 参数校验 / 未来时间戳 / 保护位 / 硬锚点 / 非 ASCII 向量 / 热度计时器 / 事件层 / 五档分区 / 墓碑两段式 / 删除路径加固（保护位·共享地址·墓碑 pin）/ `recall --at` 时点快照与未来条目隔离。
+292 项（30 组），覆盖：时间覆盖 / 乱序补录 / 三维检索 / 内容寻址 / 分支 / context 预算 / 压缩 / 压缩梯度（`--keep-detail` 与结论必留）/ 物理清除 / 出图 / 参数校验 / 未来时间戳 / 保护位 / 硬锚点 / 非 ASCII 向量 / 热度计时器 / 事件层 / 五档分区 / 墓碑两段式 / 删除路径加固（保护位·共享地址·墓碑 pin）/ `recall --at` 时点快照与未来条目隔离 / 去重不连坐与孤儿回收（`purge --gc`）/ 事件条目的时点有效性（契约 H·I）/ 人格卡三槽预算·原子写·`--at` 回看·context 集成（契约 J）。
 
 ```
 [1] 时间权重覆盖（越新越大）        ok ×4
@@ -312,7 +321,11 @@ bash scripts/selftest.sh
 [24] 事件内细节梯度压缩（结论必留）   ok ×20
 [25] 删除路径加固（保护位/共享地址）  ok ×38
 [26] recall --at 时点快照 / 未来条目  ok ×36
-通过 211 / 失败 0
+[27] 去重不连坐 + purge --gc 孤儿回收  ok ×23
+[28] 契约 H：事件条目时点有效性      ok ×20
+[29] 契约 I：事件行不打现状标记      ok ×15
+[30] 契约 J：人格卡三槽/--at/context  ok ×46
+通过 292 / 失败 0
 ```
 
 ---
@@ -332,11 +345,11 @@ memory-timeline/
 │   └── memtree.cmd       # Windows 入口
 ├── references/
 │   ├── theory.md         # 数学推导（复平面模型、打分分解、时间旅行）
-│   ├── schema.md         # 表结构、状态机、压缩梯度（§5.5）、两段式删除（§5.6）、gone_at（§5.7）、recall --at（§5.8）、未来条目（§5.9）、subject 命名、换真嵌入
+│   ├── schema.md         # 表结构、状态机、压缩梯度（§5.5）、两段式删除（§5.6）、gone_at（§5.7）、recall --at（§5.8）、未来条目（§5.9）、人格卡与 persona_log（§5.11）、subject 命名、换真嵌入
 │   └── prompts.md        # 注入模板与抽取提示词
 └── scripts/
     ├── memtree.py        # 全部实现，单文件，零依赖
-    └── selftest.sh       # 211 项自检（27 组）
+    └── selftest.sh       # 292 项自检（30 组）
 ```
 
 ---

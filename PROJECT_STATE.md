@@ -22,14 +22,14 @@
 |---|---|
 | `SKILL.md` | Agent 入口，每次会话加载（实测 **3,221 token**）。只留操作信息 + **图例行** |
 | `README.md` | 对外说明：解决什么问题、D1–D4 设计决定、实测账、与 mem0/Zep/Letta 对比、安装、自检输出 |
-| `AUDIT.md` | 按 SPEC 逐节对照（哪节已实现/部分/未实现）+ 改动记录 22 条 + 明确没做 + 下一期建议 |
+| `AUDIT.md` | 按 SPEC 逐节对照（哪节已实现/部分/未实现）+ 改动记录 24 条 + 明确没做 + 下一期建议 |
 | `PROJECT_STATE.md` | **本文件**：跨会话进度台账（能力状态、缺口、安装态、接手指南） |
 | `DESIGN.md` | 早期设计稿（问题定义、四个设计决定、代价），保留作思路存档；**与实现冲突时以 AUDIT.md 为准** |
 | `references/schema.md` | 表结构、状态机、权重公式、**§5.5 压缩梯度**、subject 命名、换真嵌入的方法 |
 | `references/theory.md` | 数学推导（复平面模型、打分分解、时间旅行），按需读，不进 SKILL |
 | `references/prompts.md` | 注入模板与抽取提示词 |
-| `scripts/memtree.py` | **全部实现**，单文件约 1.5k 行，argparse 子命令 + SQLite，零第三方依赖 |
-| `scripts/selftest.sh` | 211 项自检（27 组），末尾打印 `通过 N / 失败 M`，`FAIL>0` 则 exit 1 |
+| `scripts/memtree.py` | **全部实现**，单文件 6ddb0d1 上 2,118 行，argparse 子命令 + SQLite，零第三方依赖 |
+| `scripts/selftest.sh` | 292 项自检（30 组），末尾打印 `通过 N / 失败 M`，`FAIL>0` 则 exit 1 |
 | `bin/memtree` / `bin/memtree.cmd` | POSIX / Windows 启动器，按 `MEMTREE_PY → python3 → python → py` 找解释器 |
 | `.github/workflows/selftest.yml` | CI：Python 3.8/3.11/3.13 三档跑同一份自检 + CLI 冒烟 |
 | `.gitattributes` / `.gitignore` / `LICENSE` | 行尾规范化 / 忽略规则 / MIT |
@@ -67,7 +67,7 @@ DB 默认 `./.workbuddy/memory/memtree.db`，用 `MEMTREE_DB` 覆盖（按项目
 |---|---|---|---|
 | 归档区磁盘配额 | §3 / §9 | `zone='archive'` 只是标记，同库同表，无配额、无清理、无独立存储 | 需要真做独立归档文件或外部冷存储 |
 | 情感层 `affect` 表 | §7 | 只有 `label='emotional'` + `signals.quote` 保住用户原话；**没有 `emotion_tags / intensity` 结构化落库**；检索权重里没有情绪相关性（SPEC 要求与时间并列为主权重） | 需要先定情绪分类体系与打标来源 |
-| 人格卡 + 三层锚点 | §6 | 只有最基础形态：`type=anchor` 独立成段、永不裁剪、被更新 fact 撞上标 `⚑锚点未变` | 没有 token 上限、版本化、卡内预算（硬/软/可变三层）、变更日志、漂移检测；得先定「卡从哪来、谁批准改」 |
+| 人格卡**版本化** | §6 | 卡本体**已实现**（`12bbccb`，契约 J）：独立文件 `<db>.persona.md`、三段固定标题、三层预算 300/350/150 + 整卡 800、硬槽必须 `--force`、挤出记 `op=evict`、`persona_log` 审计、`persona show --at T` 正向重放、`context` 插 `⚓人格·硬/软/可变` 且永不裁剪 | 卡是**原地覆写**：不进 `blobs`、没有内容地址/快照/审批流，卡文件被手改也不进日志；漂移检测没有 |
 | 分类型压缩阈值 | §4.2 | 只有单一 `--days / --min-count / --heat` | 普通/重要/情感锚点三档阈值未定 |
 | 分层检索流水线 | §8.3 | 现在是一次打分（时间窗 + 权重排序）；有 `--event` 剪枝，但没串成「剪枝 → 事件过滤 → 混合相似度 → 加权排序 → 逐级展开」 | 依赖事件级权重 |
 | 事件边界自动化 | §2.2 | `event` 全靠外部 Agent 给；没有会话分段、独立事件节点、事件级权重、同类型事件秩位衰减 | 需要对话分段模型（与「零依赖、零 LLM」冲突） |
@@ -80,8 +80,8 @@ DB 默认 `./.workbuddy/memory/memtree.db`，用 `MEMTREE_DB` 覆盖（按项目
 ### 4.1 文档类缺口（不影响功能，但会误导人）
 
 - **token 数没有可信来源**：`context` 358 token / 轮、22 条库那组数据都是「事件层 + 分区层」之前的测量；`SKILL.md` 的 token 数（曾写 3,221）会随文档改动漂移，**引用前请重测**，别把旧数字当真。
-- **CI step 名**：`.github/workflows/selftest.yml` 已改成 `Run 211 self-tests`（`task-8`）。新增自检组时记得同时改它，否则 CI 日志的名字会撒谎。
-- **README 自检徽章/项数**已校正：徽章 `20/20 → 211/211`、正文 `37 项 → 114 项 → 211 项（27 组）`、组表格补到 `[26]`。
+- **CI step 名**：`.github/workflows/selftest.yml` 已改成 `Run 292 self-tests`（本轮更新）。新增自检组时记得同时改它，否则 CI 日志的名字会撒谎。
+- **README 自检徽章/项数**已按本轮实测校正为 `292/292`、`292 项（30 组）`，组表格补到 `[30]`。
 
 ---
 
@@ -91,11 +91,11 @@ DB 默认 `./.workbuddy/memory/memtree.db`，用 `MEMTREE_DB` 覆盖（按项目
 
 | 项 | 值 |
 |---|---|
-| 代码基线 | **`146f5c5`** `fix: demote blob only when no live node shares the addr; feat: purge --gc reclaims orphan blobs + stats.orphans` |
-| 本轮关键提交 | `146f5c5` 去重不连坐 + `purge --gc` · `45f9c42` [26] 测试 · `87e5179` `gone_at`/`recall --at` + 未来条目隔离 · `939bc37`/`fd8bc2f` [25] 测试 · `5855fea` 契约 F 计数 · `d330b28` 删除路径三条硬拦 · `0ac91b7` 压缩梯度文档 · `446fd66` 压缩梯度实现 |
+| 代码基线 | **`6ddb0d1`** `test: selftest [30] 钉 persona drop 硬槽必须 --force（契约 J11）` |
+| 本轮关键提交 | `6ddb0d1` J11 回归断言 · `0040ea3` 人格硬槽 drop 防漂移 · `12bbccb` 人格卡 + 三层锚点预算（契约 J） · `46ca43b`/`0d55aac` 契约 I `--at` 事件行不打现状标记 · `548c721`/`f28f9f4` 契约 H `gone_at` 判当时有效性 · `a7651b6` 台账对齐 · `146f5c5` 去重不连坐 + `purge --gc` · `45f9c42` [26] 测试 · `87e5179` `gone_at`/`recall --at` + 未来条目隔离 · `939bc37`/`fd8bc2f` [25] 测试 · `5855fea` 契约 F 计数 · `d330b28` 删除路径三条硬拦 · `0ac91b7` 压缩梯度文档 · `446fd66` 压缩梯度实现 |
 | 更早的骨架提交 | `1349794` 文档排序 · `c3c9414` 墓碑区 + 两段式删除 · `bf58645` 五档分区 · `812c828` 事件层最小版 · `13c4f40` 采样→结算→标签 |
-| 自检项数 | **211 项 / 27 组** |
-| 自检结果 | **通过 211 / 失败 0**（`146f5c5` 上实测；同一条命令在本台账写作时也跑过一次） |
+| 自检项数 | **292 项 / 30 组** |
+| 自检结果 | **通过 292 / 失败 0**（`6ddb0d1` 工作区实测，30 组） |
 
 > 提交号会变，别只信这张表：`git log --oneline -3` 永远是对的。
 
@@ -139,10 +139,10 @@ diff -rq . "$D" 2>/dev/null | grep -v '\.git'   # 期望：无输出
 
 ```bash
 cd "C:/Users/荣贤达/OneDrive/Desktop/memory-timeline"
-MEMTREE_PY="/c/Users/荣贤达/AppData/Local/Programs/Python/Python312/python.exe" bash scripts/selftest.sh
+MEMTREE_PY="/c/Users/荣贤达/AppData/Local/Programs/Python/Python312/python.exe" PYTHONIOENCODING=utf-8 bash scripts/selftest.sh
 ```
 
-（实测 Python 3.12.8。最后一行应打印 `通过 211 / 失败 0`，共 27 组。）
+（实测 Python 3.12.8。最后一行应打印 `通过 292 / 失败 0`，共 30 组；命令前还需 `PYTHONIOENCODING=utf-8`。）
 
 ---
 

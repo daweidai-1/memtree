@@ -64,6 +64,25 @@
 
 `node_id, signal_types, old_pinned, new_pinned, old_label, new_label, reason, at`
 
+### persona_log（人格改动审计，SPEC §6）
+
+**卡在文件系统，日志在库。** 三个槽的正文写在 `<db>.persona.md`（人能直接看、能 diff、能进版本控制），`persona_log` 只记「改过什么」——`persona show --at` 只能靠它正向重放，卡文件里永远只有"现在"。
+
+```
+persona_log(id INTEGER PK AUTOINCREMENT, t REAL, slot TEXT, op TEXT, old TEXT, new TEXT, reason TEXT)
+```
+
+| 字段 | 说明 |
+|---|---|
+| `id` | 自增主键，同时是「同一时刻多条改动」的排序键（`ORDER BY t, id`） |
+| `t` | 改动时刻（epoch 秒）；`--at T` 按它重放 |
+| `slot` | `hard` / `soft` / `var`（与卡文件三段标题一一对应） |
+| `op` | `add` / `del` / `evict` —— 只此三值 |
+| `old` / `new` | `add` 记 `new`；`del`/`evict` 记 `old` |
+| `reason` | `--reason` 原文；挤出自动记「超预算挤出」 |
+
+重放规则（`persona_replay()`）：从空卡起，按 `t, id` 顺序，`add` 加、`del`/`evict` 减 —— 所以 `--at` 给的是**那一刻的卡**，不是「那一刻之后的卡」。
+
 ### branches / kv
 
 `branches(name, fork_node, head_id, status, merged_into)`；`kv` 只存 `head`。
@@ -311,6 +330,92 @@ $ memtree context
 |---|---|---|
 | `[25]` 删除路径加固 | 38 | 保护位挡住 `--apply`（含墓碑区内的 pinned）；共享地址不抹正文；`--addr` 遇保护位/锚点整次拒绝；墓碑区不许 `pin`；冷却未满不删；期满真删后正文为空、`hot=2`、节点行仍在；`--restore` 分区按时间重算；`--now` 跳过冷却但**不跳过**引用计数；**计数归属**：同一地址同时命中时只计 `skipped_pinned`、不重复计 `skipped_shared`；被跳过的正文仍活着 |
 | `[26]` 时点快照 / 未来隔离 | 36 | `--at` 返回「T 那一刻是现状」的条目、不返回 T 之后才写的；T 之前已被覆盖的条目不当现状；`--at` 早于全部条目 → 空命中而不是拿后写的冒充；`status`(当时)/`status_now`(现在) 分叉；`--at` 下读全文非占位；`as_of` 回显、`as_of_stats` 四个键齐全；深回溯按 `se` 判而不被 Σ 饿死（带 `low_confidence`/`overlap`）；`context` 出 `⏳` 段且 `■` 不含未来条目；被未来覆盖者按 `gone_at > now` 补回并标 `(覆盖者在未来·此刻仍是现状)`；`total.future`；未来条目不免疫压缩 |
+
+## 5.11 人格卡：卡在文件系统，日志在库（SPEC §6）
+
+`type=anchor` 的语义一个字没变（§6.5）—— 人格卡**不是** nodes 里的一类条目，而是独立文件：
+
+| 项 | 值 |
+|---|---|
+| 默认路径 | `<db>.persona.md`（`persona_path()` :529-532：`memtree.db` → `memtree.db.persona.md`），`--persona-file` 覆盖 |
+| 文件格式 | 三段固定标题、固定顺序：`## 硬槽` / `## 软槽` / `## 可变槽`；槽内一行一条、以 `- ` 开头；空槽保留标题 |
+| 解析容错 | 未知段其下内容一律丢弃（宁可丢也不许乱归）、未知标题与空行忽略（`persona_load()` :535-556） |
+| 写盘 | 同目录临时文件 + `os.replace` 原子写（`persona_save()` :576-590）——半张卡比旧卡更糟 |
+| 日志表 | `persona_log`（§4 表定义），`op ∈ add|del|evict`（`persona_log()` :593-596） |
+
+### 预算
+
+用 `est_tokens()`（:202，中文 1 字≈1.5、ASCII≈0.3/字符）算，别用 `len/1.4`：
+
+| 闸 | 上限 | 位置 |
+|---|---|---|
+| 硬槽 | 300 | `PERSONA_SLOT_BUDGET` :66 |
+| 软槽 | 350 | 同上 |
+| 可变槽 | 150 | 同上 |
+| 整卡 | 800 | `PERSONA_TOTAL_BUDGET` :67 |
+
+总闸是兜底：正常情况槽内先挤出，只有三槽都接近饱和时总闸才可能触发。空卡算 0 token（三段标题是格式，不是人格内容）。
+
+### 写权限与超预算
+
+| 情形 | 行为 |
+|---|---|
+| 硬槽 `set` / `drop` 不带 `--force` | 拒绝、`exit 2`，提示「硬槽改动需要 --force（防人格漂移）」（`set` :653-655；`drop` :697-699；不存在的条目先幂等返回） |
+| 硬槽超 300 | **直接拒写**，不挤别人（硬槽是人格护栏，挤让 = 这次写入错了） |
+| 软/可变槽超预算 | 按**最后一次写入最旧优先**逐条挤出（`persona_last_write()` :599-604，同刻按 `id` 升序），留 `op=evict` 日志 |
+| 挤到只剩新条目仍超 | 整条回滚、`exit 2`，卡文件不动（:670-673） |
+| 整卡超 800 | 回滚 + `exit 2`，并把三槽占用报出来（:676-679） |
+| 重复写同一句 | 幂等：`changed:false`，不写文件、不写日志（:650-652） |
+
+### 审计与回看
+
+- `persona show` 回答「现在是什么」，`persona log` 回答「改过什么」。
+- `persona show --at T` 用 `persona_replay()`（:607-619）从空卡正向重放 `t<=T` 的记录；T 早于首次写入 → 打印 `(卡为空)` 且退出码 0。
+- 卡文件被人手改**不会**进日志 —— 日志只记 memtree 自己的写入，所以「卡」和「日志」可能不一致，以卡文件为现状。
+
+### context 集成
+
+卡非空时 `cmd_context()` 在首行之后、锚点之前插三行（只输出非空槽，:1184-1185）：
+
+```text
+【记忆 2026-10-26 | main#1 | 1节点·废0】
+⚓人格·硬 我是小白，老大的人
+⚓人格·软 先建直觉再上公式；……
+■ user.style: 老大喜欢先看结论
+```
+
+- 三行进 `rebuild()`，因此**计入 `--budget` 但永不被裁剪**（:1187-1188）——人格不许因为这一次预算紧张而消失。
+- 卡为空 → 一行都不出，context 输出与「没有人格卡」逐字相同。
+- `context --json` 增 `"persona":{"hard":[…],"soft":[…],"var":[…],"est_tokens":N}`（:1232）。
+
+真实输出（临时库实跑，`--db /tmp/pd.db`）：
+
+```text
+$ memtree persona set "我是小白，老大的人" --slot hard
+[memtree] 硬槽改动需要 --force（防人格漂移）                            # exit=2，卡文件未被改动
+$ memtree persona set "我是小白，老大的人" --slot hard --force --reason 初始
+{"changed": true, "slot": "hard", "slot_tokens": 12, "total_tokens": 27, "evicted": []}
+$ memtree persona set "先建直觉再上公式" --slot soft
+{"changed": true, "slot": "soft", "slot_tokens": 12, "total_tokens": 40, "evicted": []}
+$ memtree persona show
+## 硬槽
+- 我是小白，老大的人
+## 软槽
+- 先建直觉再上公式
+## 可变槽
+$ memtree persona log --limit 2
+   2 2026-10-26T17:12:39+08:00 soft add   -→先建直觉再上公式
+   1 2026-10-26T17:12:39+08:00 hard add   -→我是小白，老大的人  初始
+$ memtree persona show --at 2020-01-01
+(卡为空)                                                                # exit=0
+```
+
+### 已知取舍
+
+- 卡是纯文本文件，**没有版本化**：不进 `blobs`、没有内容地址；历史只能靠 `persona_log` 重放。
+- 硬槽只有「`set` / `drop` 不给 `--force` 就改不动」这一道闸，没有漂移检测/审批流。
+- `--at` 的可信度等于日志的完整性：直连 SQL 改库或删 `persona_log` 会让历史卡不可重建。
+- 自检 [30] 契约 J 钉的是：空卡零输出（context 里一个 `⚓人格` 都不许有）/ 硬槽 `--force` 闸且被拒时不落卡不落日志 / 软槽最旧挤出 + `op=evict` 留痕 / 硬槽超限不挤别人 / 整卡超 800 回滚且卡文件 sha256 不变 / `--at` 早于首次写入给 `(卡为空)`、两次写入之间给中间态 / 重复写幂等、`drop` 留 `op=del` / `⚓人格` 行排在锚点之前且 `--budget` 极小时不被裁。
 
 ## 6. 权重
 
