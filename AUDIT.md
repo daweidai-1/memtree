@@ -57,8 +57,8 @@
 | 10 | `compress` 默认分支改 HEAD、跳过保护位、`--heat` | :902 | 旧版写死 `main`，在别的分支上压缩静默 0 条 |
 | 11 | 自检 20 → 52 项 | scripts/selftest.sh | 上面每一项都要有回归测试，尤其「未来笔误不霸榜」和「保护位扛住裁剪」 |
 | 13 | **事件层最小版**（SPEC §2.2） | scripts/memtree.py :237 `event` 列 / `_migrate` / `cmd_commit` / `cmd_context` 事件轴 / `cmd_recall --event` | 索引必须等 `_migrate` 补列之后再建——写进 `executescript` 会让老库一打开就报错并整段回滚，升级即崩。自检 [19][20] 专测「事件随正文入上下文」与「缺列老库能平滑升级」 |
-| 15 | **墓碑区 + 两段式删除**（SPEC §3/§5.5） | scripts/memtree.py `cmd_purge()` 重写 / `PURGE_COOLDOWN_DAYS=7.0` / `nodes.tombstoned_at` `purge_reason` / `cmd_zone` 双向拒绝绕过分区接口 / `cmd_context` 墓碑计数与隐藏 / `cmd_recall` 默认排除 / `cmd_stats.tombstone` / `cmd_log` 🪦 标记 | 不可逆的决定必须留缓冲：`purge` 原来一按就烧，地址还在、正文没了。现在默认进墓碑区冷却 7 天，`--apply` 才真删、`--restore` 可撤回。墓碑区**不许**用 `zone --set` 进出——删除要走 purge 的理由与冷却，不能借分区接口绕过 |
 | 14 | **五档分区 `zone` + 单向迁移器**（SPEC §3/§4） | scripts/memtree.py `zone_target()` / `cmd_zone()` / `cmd_commit --importance` / `cmd_context` 分区门 / `cmd_recall --zone` / `cmd_stats.by_zone` / `cmd_compress` 跳过归档 | 分区只由「时间 + 重要度 + 保护位」决定：降级自动、升级必须 `--set`（铁律一/二）。老库补列后立刻按时间回填一次，否则新建列全 hot、单向降级从第一天就不成立。冷/归档被隐藏时必须显式说出条数，不许静默丢状态 |
+| 15 | **墓碑区 + 两段式删除**（SPEC §3/§5.5） | scripts/memtree.py `cmd_purge()` 重写 / `PURGE_COOLDOWN_DAYS=7.0` / `nodes.tombstoned_at` `purge_reason` / `cmd_zone` 双向拒绝绕过分区接口 / `cmd_context` 墓碑计数与隐藏 / `cmd_recall` 默认排除 / `cmd_stats.tombstone` / `cmd_log` 🪦 标记 | 不可逆的决定必须留缓冲：`purge` 原来一按就烧，地址还在、正文没了。现在默认进墓碑区冷却 7 天，`--apply` 才真删、`--restore` 可撤回。墓碑区**不许**用 `zone --set` 进出——删除要走 purge 的理由与冷却，不能借分区接口绕过 |
 | 12 | 文档校准（schema/README/SKILL） | references/schema.md、README.md、SKILL.md | README 的 554 token / 20 项自检已与实现不符；实测 context 358 token；本轮补 `event` 列与 `▣/⟦⟧` 图例 |
 
 ## 明确没做（别误以为有）
