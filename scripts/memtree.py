@@ -1196,9 +1196,16 @@ def cmd_recall(conn, a):
 
     for s, r, se, st, so in top:
         if at_mode:                                  # 回溯视角：以"当时"论现状
-            is_cur = r["id"] in cur_ids
-            flag = "「当时现状」" if is_cur else "「当时已过时」"
-            glyph = GLYPH["active"] if is_cur else GLYPH["superseded"]
+            if r["subject"]:
+                is_cur = r["id"] in cur_ids
+                flag = "「当时现状」" if is_cur else "「当时已过时」"
+                glyph = GLYPH["active"] if is_cur else GLYPH["superseded"]
+            else:
+                # 契约 I：无 subject 的条目（事件）没有"现状"可言，给它打
+                # 「当时已过时」是假信息。--at 下这类条目只说它自己的状态：
+                # 不打「当时…」，也不打非回溯模式那套「…·不可当现状」后缀。
+                flag = ""
+                glyph = GLYPH.get(r["status"], "?")
         else:
             flag = "" if r["status"] == "active" else f"「{r['status']}·不可当现状」"
             glyph = GLYPH.get(r["status"], "?")
