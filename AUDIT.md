@@ -2,7 +2,7 @@
 
 > 审计对象：本项目（v2.1，单 commit **fcddaa6**）在 2026-10 本轮改版后的状态。
 > 验收标准：那份 12 节设计 SPEC（时间+事件二维图、五档分区、遗忘流水线、人格卡与三层锚点、情感层、上下文组装、落地选型、三条铁律、8 个待定参数）。
-> 证据行号全部指向 `scripts/memtree.py`（改动后 900+ 行）。自检 `bash scripts/selftest.sh` → **通过 60 / 失败 0**。
+> 证据行号全部指向 `scripts/memtree.py`（改动后 900+ 行）。自检 `bash scripts/selftest.sh` → **通过 75 / 失败 0**。
 
 ## 一句话结论
 
@@ -57,12 +57,13 @@
 | 10 | `compress` 默认分支改 HEAD、跳过保护位、`--heat` | :902 | 旧版写死 `main`，在别的分支上压缩静默 0 条 |
 | 11 | 自检 20 → 52 项 | scripts/selftest.sh | 上面每一项都要有回归测试，尤其「未来笔误不霸榜」和「保护位扛住裁剪」 |
 | 13 | **事件层最小版**（SPEC §2.2） | scripts/memtree.py :237 `event` 列 / `_migrate` / `cmd_commit` / `cmd_context` 事件轴 / `cmd_recall --event` | 索引必须等 `_migrate` 补列之后再建——写进 `executescript` 会让老库一打开就报错并整段回滚，升级即崩。自检 [19][20] 专测「事件随正文入上下文」与「缺列老库能平滑升级」 |
+| 14 | **五档分区 `zone` + 单向迁移器**（SPEC §3/§4） | scripts/memtree.py `zone_target()` / `cmd_zone()` / `cmd_commit --importance` / `cmd_context` 分区门 / `cmd_recall --zone` / `cmd_stats.by_zone` / `cmd_compress` 跳过归档 | 分区只由「时间 + 重要度 + 保护位」决定：降级自动、升级必须 `--set`（铁律一/二）。老库补列后立刻按时间回填一次，否则新建列全 hot、单向降级从第一天就不成立。冷/归档被隐藏时必须显式说出条数，不许静默丢状态 |
 | 12 | 文档校准（schema/README/SKILL） | references/schema.md、README.md、SKILL.md | README 的 554 token / 20 项自检已与实现不符；实测 context 358 token；本轮补 `event` 列与 `▣/⟦⟧` 图例 |
 
 ## 明确没做（别误以为有）
 
 - **事件层只有最小版**：`nodes.event` 是受控短标签 + 时间区间聚合，能回答「这三个月围绕哪几件事」，但没有独立事件节点、没有事件级权重、事件边界仍靠外部 Agent 给（会话分段未做）。`subject` 仍然是「谁和谁比」的分组键，别当事件用。
-- **没有分区迁移**：热/温/冷/归档/墓碑是 SPEC 的概念，代码里只有 `status` 与 `blobs.hot`。想按 SPEC 做，得新加 `zone` 列与迁移器。
+- **分区只做了前四档**：`zone` 列 + `zone --migrate` 单向降级（hot≤7d → warm 7~90d → cold[重要度≥0.7 或保护位] → archive），升级必须 `zone --id <n> --set`。**墓碑区没做**：硬删除仍由 `purge` 直接执行，没有「进墓碑 → 冷却 7 天 → 真删」的两段式。
 - **没有情感层**：情绪、强度、金句、关系里程碑都无处可存（里程碑只能塞 `type=anchor`）。
 - **没有自动抽取**：写什么、`subject` 叫什么、摘要写什么，全由外部 Agent 决定。`subject` 的自由生成是本系统唯一的失败入口。
 - **没有 LLM 调用**：这就是零依赖的代价——「零 LLM 成本」对整条链路不成立，每轮仍要外部 Agent 抽一次。
@@ -73,14 +74,14 @@
 
 1. **受控 subject 枚举**：在 SKILL.md 里给出枚举表并让抽取器只能选，不自由生成。这一条的收益大于剩下所有 bug 的总和。
 2. ~~事件层最小版~~（已完成：`event` 列 + 事件轴 + `recall --event` 剪枝）。剩下的：会话分段自动划事件边界、事件级权重、同类型事件秩位衰减。
-3. **`zone` 列 + 单向迁移器**：热(≤7d) → 温(7~90d) → 冷(≥90d 且 importance≥0.7) → 归档；升级必须显式。做完才能兑现「压缩只压细节」。
+3. ~~`zone` 列 + 单向迁移器~~（已完成）。剩下：墓碑区 + 硬删除冷却期、归档区磁盘配额、以及「压缩只压细节」——那需要先有事件内细节梯度。
 4. **情感层独立表**：`affect(ts, emotion_tags, intensity, key_quote, event_id)`，会话内内存、结束时落一条；情感锚点用 `pinned + emotional_anchor` 双标记。
 5. **人格卡**：单独文件 + token 上限 + 变更日志；先把「卡从哪来、谁批准改」定下来，再谈版本化。
 
 ## 怎么复核本文件
 
 ```bash
-bash scripts/selftest.sh          # 期望：通过 60 / 失败 0
+bash scripts/selftest.sh          # 期望：通过 75 / 失败 0
 python scripts/memtree.py context --budget 200   # 期望：末行有「⚠ 还有 N 条未展开」
 python scripts/memtree.py stats                   # 期望：有 protected 与 heat 两段
 ```

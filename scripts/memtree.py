@@ -48,6 +48,12 @@ TAU_DAYS = 45.0        # 时间权重半衰期（天）：w = 2^(-|Δt|/45)，�
 STATEFUL = ("fact", "pref", "decision")
 ANCHOR = "anchor"      # 硬锚点：身份/关系里程碑/安全约束。不参与覆盖、不压缩、不裁剪
 GLYPH = {"active": "●", "superseded": "◐", "archived": "○", "competing": "◆"}
+# 分区（SPEC §3）：时间单向降级 hot→warm→cold→archive。升级只能显式（zone --set），
+# 因为「被问得多」不等于「值得记住」—— 调用次数不许把球往回推（铁律一）。
+ZONES = ("hot", "warm", "cold", "archive")
+ZONE_RANK = {"hot": 0, "warm": 1, "cold": 2, "archive": 3}
+HOT_DAYS, WARM_DAYS = 7.0, 90.0     # 热 ≤7 天；温 7~90 天；更旧则看重要度：冷（保护区）或归档
+COLD_MIN_IMPORTANCE = 0.7           # 进冷区（保护区）的重要度下限：冷区不是垃圾桶
 DEFAULT_DB = os.path.join(".workbuddy", "memory", "memtree.db")
 
 
@@ -236,6 +242,8 @@ def _schema(conn):
             pinned        INTEGER NOT NULL DEFAULT 0,-- 保护位：不压缩、不硬删、不裁剪
             accessed_at   REAL,                      -- 最近一次检索命中（热度代理，不参与排序）
             label         TEXT,                      -- anchor|emotional|noise —— settle 结算产物
+            zone          TEXT NOT NULL DEFAULT 'hot',   -- hot|warm|cold|archive：时间单向降级（SPEC §3）
+            importance    REAL NOT NULL DEFAULT 0.5, -- 重要度：只参与分区下限，不参与排序
             event         TEXT,                      -- 所属事件（SPEC §2.2：记忆挂在事件下，事件是时间轴上的骨节）
             source_type   TEXT NOT NULL DEFAULT 'stated', -- stated|roleplay|inferred|system
             supersedes    INTEGER,
@@ -291,18 +299,53 @@ def _schema(conn):
     conn.commit()
 
 
+def zone_target(age_days, importance, pinned=0, label=None):
+    """分区只由「时间 + 重要度 + 保护位」决定，不由调用次数决定（SPEC §3.4）。
+
+    这条规则的形状就是防漂移：降级自动发生，升级必须有人按按钮。
+    保护位把下限卡在冷区 —— 重要但低频的记忆是保护区，不是垃圾桶。
+    noise 是结算产物（重复提及但没过情绪/确认阈值）：封顶不进热区（§3.3 垃圾热点）。
+    """
+    if age_days <= HOT_DAYS:
+        z = "hot"
+    elif age_days <= WARM_DAYS:
+        z = "warm"
+    elif (importance or 0.0) >= COLD_MIN_IMPORTANCE:
+        z = "cold"
+    else:
+        z = "archive"
+    if (pinned or label == "anchor") and ZONE_RANK[z] > ZONE_RANK["cold"]:
+        z = "cold"
+    if label == "noise" and ZONE_RANK[z] < ZONE_RANK["warm"]:
+        z = "warm"
+    return z
+
+
 def _migrate(conn):
     """老库补列。CREATE TABLE IF NOT EXISTS 不会给已存在的表加新列，
     缺了这一步，升级后旧库上 pinned/accessed_at 全是 UndefinedColumn。"""
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(nodes)")}
+    added = set()
     for name, ddl in (("pinned", "INTEGER NOT NULL DEFAULT 0"),
                       ("accessed_at", "REAL"),
                       ("label", "TEXT"),
                       ("event", "TEXT"),
+                      ("zone", "TEXT NOT NULL DEFAULT 'hot'"),
+                      ("importance", "REAL NOT NULL DEFAULT 0.5"),
                       ("source_type", "TEXT NOT NULL DEFAULT 'stated'")):
         if name not in cols:
             conn.execute(f"ALTER TABLE nodes ADD COLUMN {name} {ddl}")
+            added.add(name)
     conn.commit()
+    if "zone" in added:
+        # 老库补列后全是 hot，等于「单向降级」从第一天就不成立（所有记忆都在热区），
+        # 所以补列后立刻按时间回填一次 —— 这是唯一一次允许的批量重算，之后只由 zone --migrate 走。
+        now_e = datetime.now().timestamp()
+        for r in conn.execute("SELECT id,t,importance,pinned,label FROM nodes").fetchall():
+            age = max(0.0, now_e - r["t"]) / 86400.0
+            conn.execute("UPDATE nodes SET zone=? WHERE id=?",
+                         (zone_target(age, r["importance"], r["pinned"], r["label"]), r["id"]))
+        conn.commit()
 
 
 def get_branch(conn, name):
@@ -377,16 +420,18 @@ def cmd_commit(conn, a):
     ev = re.sub(r"\s+", "_", (a.event or "").strip())
     if ev and len(ev) > 24:
         sys.exit(f"[memtree] --event 太长（{len(ev)}>24）：事件是聚合节点，请用短标签（如 换工作/搬家）")
+    # 重要度只决定「老了之后进冷区还是归档区」，不参与排序 —— 排序永远由时间说话。
+    imp = 0.5 if a.importance is None else _range(a.importance, 0.0, 1.0, "--importance")
 
     addr = _put_blob(conn, a.content)
     sem = text_vec(a.content)
 
     cur = conn.execute(
         """INSERT INTO nodes(t,outcome,subject,addr,v_text,type,scope,factor,refs,pinned,
-                             event,status,branch,parent_id,meta,ts_iso,source_type)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?, 'active', ?,?,?,?,?)""",
+                             zone,importance,event,status,branch,parent_id,meta,ts_iso,source_type)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?, 'active', ?,?,?,?,?)""",
         (t_epoch, outcome, subject, addr, pack_real(sem),
-         ntype, scope, a.factor, refs, pinned, ev or None, bname, parent, a.meta, ts,
+         ntype, scope, a.factor, refs, pinned, "hot", imp, ev or None, bname, parent, a.meta, ts,
          getattr(a, "source", None) or "stated"),
     )
     nid = cur.lastrowid
@@ -652,6 +697,13 @@ def cmd_context(conn, a):
     stateful = [r for r in _rows(conn, """SELECT * FROM nodes WHERE status IN ('active','competing')
                                           AND type IN ('fact','pref','decision')
                                           AND (scope='global' OR branch=?)""", (branch,))]
+    # 默认只加载热区与温区（SPEC §8：默认少量预取，冷/归档按需）。
+    # 保护位与锚点是例外 —— 重要但低频的记忆永远在。隐藏了必须说出来，否则就是静默丢状态。
+    _hid_ids = {r["id"] for r in stateful
+                if (r["zone"] or "hot") not in ("hot", "warm") and not r["pinned"]
+                and r["label"] != "anchor"}
+    _zone_hidden = len(_hid_ids)
+    stateful = [r for r in stateful if r["id"] not in _hid_ids]
     wmap = _w(conn, stateful, now_e)
     anchored_sub = {x["subject"] for x in conn.execute(
         "SELECT subject FROM nodes WHERE type=? AND status='active'", (ANCHOR,))
@@ -665,6 +717,8 @@ def cmd_context(conn, a):
             line += "  ⚑锚点未变"
         if r["event"]:                      # 事件标签：这条现状属于时间轴上的哪一节
             line += f"  ⟦{r['event']}⟧"
+        if (r["zone"] or "hot") == "cold":   # 冷区（保护区）：还在，但不再占热区
+            line += "  ❄冷"
         return line
 
     # 冲突聚合：同 subject 下 >1 条待定
@@ -727,10 +781,10 @@ def cmd_context(conn, a):
     n_all = conn.execute("SELECT COUNT(*) c FROM nodes").fetchone()["c"]
     n_cold = conn.execute("SELECT COUNT(*) c FROM nodes WHERE status!='active'").fetchone()["c"]
     head = conn.execute("SELECT head_id FROM branches WHERE name=?", (branch,)).fetchone()["head_id"]
-    legend = ("※ ⚓锚点 ■现状 ▣事件轴 ⟦事件名⟧ ★钉=保护位 ◇假设 ○分支(回顾点) ·事件"
+    legend = ("※ ⚓锚点 ■现状 ▣事件轴 ⟦事件名⟧ ❄冷 ★钉=保护位 ◇假设 ○分支(回顾点) ·事件"
               "  (曾:…@日期)=已废弃，禁止当作现状")
     head_line = (f"【记忆 {ref.strftime('%Y-%m-%d')} | {branch}#{head or '-'} "
-                 f"| {n_all}节点·冷{n_cold}】")
+                 f"| {n_all}节点·废{n_cold}】")
     n_fact_all, n_ev_all = len(facts), len(events)
 
     def rebuild():
@@ -760,6 +814,9 @@ def cmd_context(conn, a):
     out = "\n".join(rebuild())
     # 静默丢状态是本项目最贵的 bug：模型看到 18 条就会笃定答「没记录过」。
     # 溢出必须说出来 —— 宁可超预算一行，也不能让 Agent 以为自己看到了全部。
+    if _zone_hidden:
+        out += (f"\n❄ 冷区/归档 {_zone_hidden} 条未加载（保护位与锚点除外）"
+                " —— 显式查：recall --zone cold 或 recall --zone archive")
     dropped = (n_fact_all - len(facts)) + (n_ev_all - len(events))
     if dropped:
         out += (f"\n⚠ 还有 {dropped} 条未展开"
@@ -825,6 +882,8 @@ def cmd_recall(conn, a):
             continue
         if a.event and (r["event"] or "") != a.event:   # 事件层过滤：先按事件剪枝，再算相似度
             continue
+        if a.zone and (r["zone"] or "hot") not in [z.strip() for z in a.zone.split(",")]:
+            continue
         # 不硬性过滤"未来"：事件的结果可能在事后才确定。
         # "当时的状态"由上面的 cur_ids 保证（同 subject 只留 t≤t_ref 的最大者）。
         if a.days is not None and (t_ref - r["t"]) / 86400.0 > a.days:
@@ -860,7 +919,7 @@ def cmd_recall(conn, a):
         emit(conn, {"query": q_text, "t": a.at or now_iso(), "outcome": r_ref, "hits": [
             {"id": r["id"], "score": round(s, 3), "sem": round(se, 2), "time": round(st, 2),
              "out": round(so, 2), "status": r["status"],
-             "subject": r["subject"], "event": r["event"], "addr": r["addr"],
+             "subject": r["subject"], "event": r["event"], "zone": r["zone"], "addr": r["addr"],
              "overlap": round(ovmap[r["id"]], 2),
              "low_confidence": ovmap[r["id"]] == 0.0,
              "content": content_of(conn, r["addr"], True),
@@ -1073,6 +1132,8 @@ def cmd_compress(conn, a):
     rows = [r for r in _rows(conn)
             if r["status"] == "active" and r["type"] == "event" and r["t"] < cut
             and r["branch"] == br and r["id"] not in keep and not r["pinned"]
+            # 归档区已经压过一轮了：再压一次只会得到摘要的摘要，信息不可逆丢失
+            and (r["zone"] or "hot") != "archive"
             # 热度门（§4.1）：热度是计时器 —— 只有"久没被碰过"的候选才准压缩。
             # 最近被 recall 命中过的老事件热度仍高，会被这一条挡下来。
             # label='noise' 是结算产物：只有重复提及、没到情绪/确认阈值。
@@ -1101,6 +1162,48 @@ def cmd_compress(conn, a):
     emit(conn, {"summary_node": sid, "rolled": len(rows), "span": span, "text": body})
 
 
+def cmd_zone(conn, a):
+    """分区维护。三种用法：看分布 / 单向降级 / 显式升级。"""
+    now_e = datetime.now().timestamp()
+    if a.set:
+        if not a.id:
+            sys.exit("[memtree] zone --set 需要 --id <节点号>")
+        if a.set not in ZONES:
+            sys.exit(f"[memtree] 未知分区: {a.set}（可选 {chr(47).join(ZONES)}）")
+        r = node(conn, a.id)
+        cur = r["zone"] or "hot"
+        conn.execute("UPDATE nodes SET zone=? WHERE id=?", (a.set, a.id))
+        conn.commit()
+        emit(conn, {"id": a.id, "from": cur, "to": a.set, "explicit": True,
+                    "note": "升级只能显式：分区不因调用次数上浮（铁律二）"})
+        return
+    if a.migrate:
+        moved, blocked = [], 0
+        for r in conn.execute("SELECT id,t,zone,importance,pinned,label FROM nodes").fetchall():
+            age = max(0.0, now_e - r["t"]) / 86400.0
+            tgt = zone_target(age, r["importance"], r["pinned"], r["label"])
+            cur = r["zone"] or "hot"
+            if ZONE_RANK[tgt] > ZONE_RANK[cur]:
+                conn.execute("UPDATE nodes SET zone=? WHERE id=?", (tgt, r["id"]))
+                moved.append({"id": r["id"], "from": cur, "to": tgt})
+            elif ZONE_RANK[tgt] < ZONE_RANK[cur]:
+                # 只降不升：想让它回热区，必须有人显式按按钮（铁律一）
+                blocked += 1
+        conn.commit()
+        emit(conn, {"migrated": len(moved), "down": moved[:20],
+                    "kept_by_direction": blocked,
+                    "note": "单向：自动只降级；升级用 zone --id <n> --set hot"})
+        return
+    dist = {z: 0 for z in ZONES}
+    for r in conn.execute("SELECT zone,COUNT(*) c FROM nodes GROUP BY zone"):
+        dist[r["zone"] or "hot"] = r["c"]
+    emit(conn, {"zones": dist,
+                "thresholds": {"hot": "<=7d", "warm": "7~90d",
+                               "cold": f">90d 且 importance>={COLD_MIN_IMPORTANCE}（或保护位）",
+                               "archive": ">90d 且重要度不够"},
+                "next": "zone --migrate 单向降级；zone --id <n> --set hot 显式升级"})
+
+
 def _heat_hist(conn):
     """热度分布：让"哪些旧了、哪些还被用到"变成可观测的事实，而不是感觉。"""
     t_now = datetime.now().timestamp()
@@ -1127,9 +1230,11 @@ def cmd_stats(conn, a):
         "heat": _heat_hist(conn),
         "by_label": {r["label"] or "null": r["c"]
                      for r in g("SELECT label,COUNT(*) c FROM nodes GROUP BY label")},
+        "by_zone": {r["zone"] or "hot": r["c"]
+                    for r in g("SELECT zone,COUNT(*) c FROM nodes GROUP BY zone")},
         "pending_signals": g("SELECT COUNT(*) c FROM signals WHERE settled=0")[0]["c"],
         "vec_dims": VEC_D,
-        "note": "热度只用于触发压缩（§4.1），不参与排序；锚点/保护位不压缩、不裁剪、不硬删",
+        "note": "热度只用于触发压缩（§4.1），不参与排序；分区只随时间单向降级、升级须显式；锚点/保护位不压缩、不裁剪、不硬删",
     })
 
 
@@ -1167,6 +1272,8 @@ def main(argv=None):
                             ANCHOR])
     s.add_argument("--outcome", type=float, help="结果值 [-1,1]：+成功/有效，-失败/无效")
     s.add_argument("--refs", type=int, default=0, help="初始可信度引用次数（重复陈述可累加）")
+    s.add_argument("--importance", type=float,
+                   help="重要度 [0,1]，默认 0.5。只决定老了进冷区还是归档区，不参与排序")
     s.add_argument("--scope", choices=["global", "branch"])
     s.add_argument("--branch", default=None)
     s.add_argument("--parent", type=int)
@@ -1221,6 +1328,7 @@ def main(argv=None):
     s.add_argument("--outcome", type=float, help="期望结果值 [-1,1]")
     s.add_argument("--days", type=float, help="时间窗：只要 ±N 天内")
     s.add_argument("--event", help="只在此事件内检索（先剪枝，再算相似度）")
+    s.add_argument("--zone", help="只看这些分区：hot,warm,cold,archive（逗号分隔）")
     s.add_argument("--mode", default="and", choices=["and", "mix"],
                    help="and=内积定位（默认），mix=语义优先（时间只做微调）")
     s.add_argument("--branch"); s.add_argument("--top", type=int, default=5)
@@ -1240,6 +1348,12 @@ def main(argv=None):
 
     s = add("purge", cmd_purge, "物理删除已覆盖记忆的正文，只留地址")
     s.add_argument("--addr")
+
+    s = add("zone", cmd_zone, "分区：看分布 / 单向降级 / 显式升级")
+    s.add_argument("id", type=int, nargs="?")
+    s.add_argument("--set", choices=ZONES, help="显式指定分区（升级唯一入口）")
+    s.add_argument("--migrate", action="store_true", help="按时间单向降级（只降不升）")
+    s.add_argument("--json", action="store_true")
 
     s = add("pin", cmd_pin, "打/取消保护位（重要但低频的冷信息）")
     s.add_argument("id", type=int)

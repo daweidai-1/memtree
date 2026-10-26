@@ -31,6 +31,8 @@
 | `pinned` | INTEGER 0/1，保护位。1 = context 永不裁剪、compress 永不覆盖、purge 拒绝硬删 |
 | `accessed_at` | REAL，epoch 秒，最后一次被 `recall`/`signal` 碰过的时间。**只用于算热度，不累计次数** |
 | `label` | `anchor / emotional / noise / NULL`。**`settle` 的结算产物**：写入后不可由热度改写 |
+| `zone` | `hot / warm / cold / archive`。**只随时间单向降级**：≤7d 热、7~90d 温、更旧则 `importance ≥ 0.7`（或保护位/锚点）进冷区、否则归档。升级只能 `zone --id <n> --set` —— 调用次数不许升区 |
+| `importance` | REAL 0~1，默认 0.5。**只参与分区下限，不参与排序**（排序永远由时间说话） |
 | `event` | 受控短标签（≤24 字）。**聚合键，不是句子**：同一件事的多次提及共用一个 `event`，`context` 据此输出 `▣ 名 起~止 n条`（`MIN(t)/MAX(t)` 即跨期区间），`recall --event` 用它在算相似度之前剪枝 |
 | `source_type` | `stated / roleplay / inferred / system`。`roleplay` 永不打情感锚点（防虚构污染） |
 

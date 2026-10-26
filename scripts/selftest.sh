@@ -206,6 +206,47 @@ EOF
 $M context --budget 500 >/dev/null 2>&1 && { PASS=$((PASS+1)); echo "  ok   缺列的老库能打开"; } || { FAIL=$((FAIL+1)); echo "  FAIL 老库升级直接报错"; }
 chk "event 列已补回" "\"event\" in [r[1] for r in c.execute(\"PRAGMA table_info(nodes)\")]"
 chk "idx_ev 索引已建" "c.execute(\"select count(*) from sqlite_master where type='index' and name='idx_ev'\").fetchone()[0]==1"
+echo "[21] 五档分区（SPEC §3/§4：时间单向降级，升级必须显式）"
+$M commit "热区刚写的事实" --type fact --subject z.hot --importance 0.9 -q >/dev/null
+$M commit "二十天前的温区事实" --type fact --subject z.warm --ts "2026-10-05T10:00:00+08:00" -q >/dev/null
+$M commit "两百天前但重要：家人纪念日" --type fact --subject z.cold --importance 0.95 --ts "2026-04-01T10:00:00+08:00" -q >/dev/null
+IDARC=$($M commit "两百天前不重要：随口一提的天气" --type fact --subject z.arc --ts "2026-04-02T10:00:00+08:00" -q | tail -1)
+IDPIN=$($M commit "两百天前的保护位记忆" --type fact --subject z.pin --pin --ts "2026-04-03T10:00:00+08:00" -q | tail -1)
+$M zone --migrate >/dev/null
+chk "热区仍在热区" "c.execute(\"select zone from nodes where subject='z.hot'\").fetchone()[0]=='hot'"
+chk "20 天降成温区" "c.execute(\"select zone from nodes where subject='z.warm'\").fetchone()[0]=='warm'"
+chk "200 天且重要 → 冷区（保护区）" "c.execute(\"select zone from nodes where subject='z.cold'\").fetchone()[0]=='cold'"
+chk "200 天不重要 → 归档区" "c.execute(\"select zone from nodes where subject='z.arc'\").fetchone()[0]=='archive'"
+chk "保护位把下限卡在冷区，不进归档" "c.execute(\"select zone from nodes where id=$IDPIN\").fetchone()[0]=='cold'"
+ZM1=$($M zone --migrate)
+echo "$ZM1" | grep -q '"migrated": 0' && { PASS=$((PASS+1)); echo "  ok   migrate 幂等（重跑 0 变动）"; } || { FAIL=$((FAIL+1)); echo "  FAIL migrate 不幂等"; }
+$M zone $IDARC --set hot >/dev/null
+chk "显式升级能回热区" "c.execute(\"select zone from nodes where id=$IDARC\").fetchone()[0]=='hot'"
+$M zone --migrate >/dev/null
+$M recall "随口一提的天气" --top 1 >/dev/null
+$M recall "随口一提的天气" --top 1 >/dev/null
+$M recall "随口一提的天气" --top 1 >/dev/null
+$M zone --migrate >/dev/null
+chk "被反复调用也不能升区（铁律二：热度不是裁判）" "c.execute(\"select zone from nodes where id=$IDARC\").fetchone()[0]=='archive'"
+ZCTX=$($M context --budget 3000)
+echo "$ZCTX" | grep -q "冷区/归档 .* 条未加载" && { PASS=$((PASS+1)); echo "  ok   冷/归档未加载必须明说"; } || { FAIL=$((FAIL+1)); echo "  FAIL 冷区被静默隐藏"; }
+echo "$ZCTX" | grep -q "家人纪念日" && { FAIL=$((FAIL+1)); echo "  FAIL 冷区不该默认进上下文"; } || { PASS=$((PASS+1)); echo "  ok   冷区默认不占上下文"; }
+ZX=$($M recall "保护位记忆" --zone cold --top 3)
+echo "$ZX" | grep -q "保护位记忆" && { PASS=$((PASS+1)); echo "  ok   recall --zone cold 显式可查"; } || { FAIL=$((FAIL+1)); echo "  FAIL --zone 过滤失效"; }
+MZ=$($M stats)
+echo "$MZ" | grep -q '"by_zone"' && { PASS=$((PASS+1)); echo "  ok   stats 有分区分布"; } || { FAIL=$((FAIL+1)); echo "  FAIL stats 缺 by_zone"; }
+
+echo "[22] 老库补 zone/importance 列并按时间回填"
+"$PY" - "$MEMTREE_DB" <<'EOF'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+c.execute("ALTER TABLE nodes DROP COLUMN zone")
+c.execute("ALTER TABLE nodes DROP COLUMN importance")
+c.commit()
+EOF
+$M context --budget 3000 >/dev/null 2>&1 && { PASS=$((PASS+1)); echo "  ok   缺 zone 列的老库能打开"; } || { FAIL=$((FAIL+1)); echo "  FAIL 老库缺 zone 直接报错"; }
+chk "zone 列已补回" "\"zone\" in [r[1] for r in c.execute(\"PRAGMA table_info(nodes)\")]"
+chk "补列后不是全 hot（已按时间回填）" "c.execute(\"select count(*) from nodes where zone!='hot'\").fetchone()[0]>0"
 echo
 echo "通过 $PASS / 失败 $FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
