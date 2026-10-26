@@ -22,14 +22,14 @@
 |---|---|
 | `SKILL.md` | Agent 入口，每次会话加载（实测 **3,221 token**）。只留操作信息 + **图例行** |
 | `README.md` | 对外说明：解决什么问题、D1–D4 设计决定、实测账、与 mem0/Zep/Letta 对比、安装、自检输出 |
-| `AUDIT.md` | 按 SPEC 逐节对照（哪节已实现/部分/未实现）+ 改动记录 16 条 + 明确没做 + 下一期建议 |
+| `AUDIT.md` | 按 SPEC 逐节对照（哪节已实现/部分/未实现）+ 改动记录 22 条 + 明确没做 + 下一期建议 |
 | `PROJECT_STATE.md` | **本文件**：跨会话进度台账（能力状态、缺口、安装态、接手指南） |
 | `DESIGN.md` | 早期设计稿（问题定义、四个设计决定、代价），保留作思路存档；**与实现冲突时以 AUDIT.md 为准** |
 | `references/schema.md` | 表结构、状态机、权重公式、**§5.5 压缩梯度**、subject 命名、换真嵌入的方法 |
 | `references/theory.md` | 数学推导（复平面模型、打分分解、时间旅行），按需读，不进 SKILL |
 | `references/prompts.md` | 注入模板与抽取提示词 |
 | `scripts/memtree.py` | **全部实现**，单文件约 1.5k 行，argparse 子命令 + SQLite，零第三方依赖 |
-| `scripts/selftest.sh` | 114 项自检（24 组），末尾打印 `通过 N / 失败 M`，`FAIL>0` 则 exit 1 |
+| `scripts/selftest.sh` | 211 项自检（27 组），末尾打印 `通过 N / 失败 M`，`FAIL>0` 则 exit 1 |
 | `bin/memtree` / `bin/memtree.cmd` | POSIX / Windows 启动器，按 `MEMTREE_PY → python3 → python → py` 找解释器 |
 | `.github/workflows/selftest.yml` | CI：Python 3.8/3.11/3.13 三档跑同一份自检 + CLI 冒烟 |
 | `.gitattributes` / `.gitignore` / `LICENSE` | 行尾规范化 / 忽略规则 / MIT |
@@ -43,15 +43,19 @@ DB 默认 `./.workbuddy/memory/memtree.db`，用 `MEMTREE_DB` 覆盖（按项目
 | 能力 | 状态 | 接口在哪 | 一句话证据 |
 |---|---|---|---|
 | 事件层（SPEC §2.2） | **已实现（最小版）** | `commit --event`（受控短标签 ≤24 字，超长直接拒写）；`nodes.event`；`context` 事件轴 `▣ 名 起~止 n条`；`recall --event` 在算相似度**之前**剪枝 | 自检专测「事件随正文进 context」与「缺列老库平滑升级」；事件边界仍由外部 Agent 给（无会话分段） |
-| 三维检索 | **已实现** | `recall --at --outcome --days --event --mode --status --top`；时间项 `time_weight()`:76、总权重 `weight()`:388 | 输出行自带三元分解 `t·0.99 r·+0.90 sem+0.42 Σ=+0.57`；自检 [3] 同 query 换 `--outcome ±0.9` 命中不同节点 |
-| 内容寻址 | **已实现** | `blobs.addr = sha256(正文)[:16]`（`addr_of()`:201）；`verify <addr>`、`show <id>` | 相同内容天然去重；`verify` 重算 sha256 比对，篡改必被发现 |
+| 三维检索 | **已实现** | `recall --at --outcome --days --event --mode --status --top`；时间项 `time_weight()`:76、总权重 `weight()`:455 | 输出行自带三元分解 `t·0.99 r·+0.90 sem+0.42 Σ=+0.57`；自检 [3] 同 query 换 `--outcome ±0.9` 命中不同节点 |
+| 内容寻址 | **已实现** | `blobs.addr = sha256(正文)[:16]`（`addr_of()`:203）；`verify <addr>`、`show <id>` | 相同内容天然去重；`verify` 重算 sha256 比对，篡改必被发现 |
 | 分支 | **已实现（语义弱）** | `branch --from <id>` / `checkout` / `merge --summary`；`branches(name,fork_node,head_id,status,merged_into)` | 自检 [5] 3 条；`compress` 默认跟随当前 HEAD（旧实现写死 `main`，侧枝压不到） |
-| 保护位 / 硬锚点 | **已实现** | `commit --pin`、`pin <id> [--off]`（`cmd_pin()`:498）；`type=anchor` 独立成段、撞上更新的 fact 标 `⚑锚点未变`（:388-407） | 自检 [12] 5 条（不裁剪/不压缩/不硬删）、[13] 3 条（不被现状吞掉） |
-| 热度与压缩计时器 | **已实现** | `heat_of()`:87 = `0.5^(距上次访问天数/45)`，**只看「距上次访问」，不累计次数**；唯一消费者 `compress --heat`；`stats` 热度直方图 `_heat_hist()`:1337 | 自检 [15] 3 条；热度不进 `weight()` —— 不参与排序、不进上下文、不升区 |
-| 采样 → 结算 → 打标签 | **已实现** | `signal --type user_confirm\|correction\|emotional_peak\|repeat_mention`；`settle`（`_judge()`:530 走规则、不调 LLM）；`label <id> anchor\|emotional\|noise\|clear`；`signals` + `settle_log` 两表 | 自检有「anchor 不被压缩」「noise 豁免热度门」；每次结算写 `settle_log`，可审计 |
-| 五档分区 hot/warm/cold/archive/tombstone | **已实现** | `nodes.zone` + `ZONES`:53 + `zone_target()`:303；`zone --migrate` **单向降级**、`zone --id N --set X` **唯一升级入口**（`tombstone` 除外，:1298 拒绝）；`context` 分区门；`recall --zone`；`stats.by_zone` | 自检：冷区/墓碑条数必须明说、不许静默隐藏；老库补列后按时间回填一次（否则单向降级从第一天就不成立） |
-| 墓碑两段式删除 | **已实现** | `purge`（`cmd_purge()`:1039）：默认进墓碑（`zone='tombstone'` + `tombstoned_at` + `purge_reason`），冷却 `PURGE_COOLDOWN_DAYS=7.0`:55；`--apply` 期满真删、`--restore` 撤回、`--now` 隐私直通车、`--list` 报 `days_left` | 自检：冷却未满不真删 / 期满真删正文清空只留悬空地址 / 保护位拒绝 purge / `zone --set tombstone` 被拒 |
-| **事件内细节梯度压缩**（SPEC §5 ①） | **已实现**（`446fd66`） | `compress --keep-detail N`（默认 1）+ `--min-count`（默认 3）+ `is_conclusion()`:1205 + `cmd_compress()`:1216；`nodes.rolled_into`、`meta{rolled,ids,event,kept_detail}` | 自检 `[24]` 20 条断言全绿：`rolled_into` 指向 / `hot=0` 非删除 / 最新 N 条逐字保留 / 事件标签继承 / 两事件不合并 / 四类结论必留 / `conclusions_preserved` 精确性 / `--keep-detail 0` 退化 / 二次压缩幂等。文档落点：`references/schema.md` §5.5、README「压缩是梯度，不是剪切」、SKILL 的 compress 段、AUDIT #16 |
+| 保护位 / 硬锚点 | **已实现** | `commit --pin`、`pin <id> [--off]`（`cmd_pin()`:610）；`type=anchor` 独立成段、撞上更新的 fact 标 `⚑锚点未变`（`cmd_context()` :804 一带）；墓碑区节点拒绝 `pin`（:573） | 自检 [12] 5 条（不裁剪/不压缩/不硬删）、[13] 3 条（不被现状吞掉） |
+| 热度与压缩计时器 | **已实现** | `heat_of()`:87 = `0.5^(距上次访问天数/45)`，**只看「距上次访问」，不累计次数**；衰减起点是 `max(accessed_at, min(t, now))` —— 未来条目不许把起点跑进未来；唯一消费者 `compress --heat`；`stats` 热度直方图 `_heat_hist()`:1624 | 自检 [15] 3 条；热度不进 `weight()` —— 不参与排序、不进上下文、不升区 |
+| 采样 → 结算 → 打标签 | **已实现** | `signal --type user_confirm\|correction\|emotional_peak\|repeat_mention`；`settle`（`_judge()`:645 走规则、不调 LLM）；`label <id> anchor\|emotional\|noise\|clear`；`signals` + `settle_log` 两表 | 自检有「anchor 不被压缩」「noise 豁免热度门」；每次结算写 `settle_log`，可审计 |
+| 五档分区 hot/warm/cold/archive/tombstone | **已实现** | `nodes.zone` + `ZONES`:53 + `zone_target()`:306；`zone --migrate` **单向降级**、`zone --id N --set X` **唯一升级入口**（`tombstone` 除外，:1586 拒绝）；`context` 分区门；`recall --zone`；`stats.by_zone` | 自检：冷区/墓碑条数必须明说、不许静默隐藏；老库补列后按时间回填一次（否则单向降级从第一天就不成立） |
+| 墓碑两段式删除 | **已实现**（`d330b28` 加固） | `purge`（`cmd_purge()`:1266）：默认进墓碑（`zone='tombstone'` + `tombstoned_at` + `purge_reason`），冷却 `PURGE_COOLDOWN_DAYS=7.0`:55；`--apply` 期满真删、`--restore` 撤回、`--now` 隐私直通车、`--list` 报 `days_left`、`--addr` 按地址、`--reason` 记理由 | 自检 [23] 18 条 + [25] 38 条 |
+| 删除路径三条硬拦 | **已实现**（`d330b28` / `5855fea`） | `pinned_refs()`:454（**含墓碑区内的 pinned**）→ `skipped_pinned`；`live_refs()`:442（`zone<>'tombstone'`，active/superseded/archived 全算）→ `skipped_shared`；`cmd_pin()` :573 拒绝墓碑区节点。计数归属：同时命中只计 `skipped_pinned` | 自检 [25]：共享地址不抹正文、`--now` 不跳过引用计数、`pin` 墓碑被拒、`zone --set tombstone` 被拒（:1586） |
+| **事件内细节梯度压缩**（SPEC §5 ①） | **已实现**（`446fd66`） | `compress --keep-detail N`（默认 1）+ `--min-count`（默认 3）+ `is_conclusion()`:1476 + `cmd_compress()`:1487；`nodes.rolled_into`、`meta{rolled,ids,event,kept_detail}` | 自检 `[24]` 20 条断言全绿：`rolled_into` 指向 / `hot=0` 非删除 / 最新 N 条逐字保留 / 事件标签继承 / 两事件不合并 / 四类结论必留 / `conclusions_preserved` 精确性 / `--keep-detail 0` 退化 / 二次压缩幂等。文档落点：`references/schema.md` §5.5、README「压缩是梯度，不是剪切」、SKILL 的 compress 段、AUDIT #16 |
+| **时点回溯 `recall --at`**（`87e5179`） | **已实现** | `nodes.gone_at`（`_migrate()`:341 补列、:347-359 回填：superseded 取 `superseded_by` 的 `t`、archived 取 `rolled_into` 的 `t`，回填不到留 NULL）+ `cmd_recall()` :1015-1122：`as_of` / `as_of_stats{active,not_yet,already_gone,unknown_timing}` / `status`(当时) / `status_now`(现在) | 自检 [26] 36 条：T 之后才写的不当现状、T 之前已失效的不返回、`--at` 读全文非「已转冷」占位、深回溯按语义重合 `se` 判而非 Σ。文档落点：`references/schema.md` §5.7/§5.8、README「回溯问的是当时，不是现在」、AUDIT #20/#21 |
+| **未来条目隔离**（`87e5179`） | **已实现** | `cmd_context()`：未来条目另起 `⏳ 未来 N 条尚未发生（不参与现状判定）` 段（:973）、不进 `■`、被未来覆盖者按 `gone_at > now` 补回并标 `(覆盖者在未来·此刻仍是现状)`（:829-841）、`context --json` 的 `total.future`（:983）；`heat_of()` 用 `min(t, now)` 使未来条目不免疫压缩 | 自检 [26]：`■` 不含未来正文、补回行标记、`total.future`、未来条目被 `compress` 压成 archived（有 `rolled_into`）。文档落点：`references/schema.md` §5.9、README「回溯问的是当时，不是现在」末条 |
+| **去重不连坐 + 孤儿正文回收**（`146f5c5`） | **已实现** | `_cold_blob()`:475（只有「全库没有活节点共用该地址」才转冷）；`orphan_addrs()`:464 + `purge --gc [--dry-run]`（只删 `blobs` 行、不删 `nodes` 行）+ `stats.blobs.orphans` / `orphan_bytes` | 覆盖时不再把共用地址的活节点正文一起转冷；孤儿正文可显式释放，墓碑节点仍算引用者所以冷却期内不会被当孤儿 |
 
 ---
 
@@ -75,9 +79,9 @@ DB 默认 `./.workbuddy/memory/memtree.db`，用 `MEMTREE_DB` 覆盖（按项目
 
 ### 4.1 文档类缺口（不影响功能，但会误导人）
 
-- **README 的实测数字已过期**：`context` 358 token / 轮、22 条库那组数据是「事件层 + 分区层」之前的测量；本轮实测 `SKILL.md` 已是 **3,221 token**（README 原写 ~2,130），已按实测更正，但其余命令的 token 数**尚未在完整功能库上重测**。
-- **CI step 名过期**：`.github/workflows/selftest.yml` 里 step 仍叫 `Run 20 self-tests`，实际 114 项。改它要动 CI 文件，注意边界。
-- **README 自检徽章/项数**已在本轮校正：徽章 `20/20 → 114/114`、正文 `37 项 → 114 项`。
+- **token 数没有可信来源**：`context` 358 token / 轮、22 条库那组数据都是「事件层 + 分区层」之前的测量；`SKILL.md` 的 token 数（曾写 3,221）会随文档改动漂移，**引用前请重测**，别把旧数字当真。
+- **CI step 名**：`.github/workflows/selftest.yml` 已改成 `Run 211 self-tests`（`task-8`）。新增自检组时记得同时改它，否则 CI 日志的名字会撒谎。
+- **README 自检徽章/项数**已校正：徽章 `20/20 → 211/211`、正文 `37 项 → 114 项 → 211 项（27 组）`、组表格补到 `[26]`。
 
 ---
 
@@ -87,10 +91,11 @@ DB 默认 `./.workbuddy/memory/memtree.db`，用 `MEMTREE_DB` 覆盖（按项目
 
 | 项 | 值 |
 |---|---|
-| 代码基线 | **`446fd66`** `feat: in-event detail gradient compression (SPEC 5-1)` |
+| 代码基线 | **`146f5c5`** `fix: demote blob only when no live node shares the addr; feat: purge --gc reclaims orphan blobs + stats.orphans` |
+| 本轮关键提交 | `146f5c5` 去重不连坐 + `purge --gc` · `45f9c42` [26] 测试 · `87e5179` `gone_at`/`recall --at` + 未来条目隔离 · `939bc37`/`fd8bc2f` [25] 测试 · `5855fea` 契约 F 计数 · `d330b28` 删除路径三条硬拦 · `0ac91b7` 压缩梯度文档 · `446fd66` 压缩梯度实现 |
 | 更早的骨架提交 | `1349794` 文档排序 · `c3c9414` 墓碑区 + 两段式删除 · `bf58645` 五档分区 · `812c828` 事件层最小版 · `13c4f40` 采样→结算→标签 |
-| 自检项数 | **114 项 / 24 组** |
-| 自检结果 | **通过 114 / 失败 0**（`446fd66` 上实测；同一条命令在本台账写作时也跑过一次） |
+| 自检项数 | **211 项 / 27 组** |
+| 自检结果 | **通过 211 / 失败 0**（`146f5c5` 上实测；同一条命令在本台账写作时也跑过一次） |
 
 > 提交号会变，别只信这张表：`git log --oneline -3` 永远是对的。
 
@@ -120,7 +125,7 @@ diff -rq . "$D" 2>/dev/null | grep -v '\.git'   # 期望：无输出
 ```
 
 - `PROJECT_STATE.md` **不在这六件里**：它是仓库台账，Agent 运行时只读 `SKILL.md`。要给人看就顺手 `cp PROJECT_STATE.md "$D/"`。
-- 本次核对时的实测差异：`diff -rq` 只报 `scripts/memtree.py` 不同（文档当时一致）——即**代码已漂移，文档没漂**。
+- 本次核对（`task-8`）时仓库已改到 `146f5c5`，而安装态是旧的 —— **代码和文档都漂了**，两份都得覆盖。`diff -rq` 是唯一可信的判据，别凭印象。
 
 ### 5.3 自检怎么跑（本机必须先给解释器）
 
@@ -137,7 +142,7 @@ cd "C:/Users/荣贤达/OneDrive/Desktop/memory-timeline"
 MEMTREE_PY="/c/Users/荣贤达/AppData/Local/Programs/Python/Python312/python.exe" bash scripts/selftest.sh
 ```
 
-（实测 Python 3.12.8。最后一行应打印 `通过 114 / 失败 0`。）
+（实测 Python 3.12.8。最后一行应打印 `通过 211 / 失败 0`，共 27 组。）
 
 ---
 
@@ -188,7 +193,7 @@ EOF
 4. **新增列必须走 `_migrate`**：`ALTER TABLE` + 索引要在补列**之后**建。把 `CREATE INDEX` 写进建表的 `executescript` 会让老库一打开就报错并整段回滚（升级即崩，AUDIT #13 记过）。
 5. **分区不许借道上浮**：`zone --set` 是唯一升级入口；`tombstone` 只能由 `purge` 进入（删除要带理由与冷却）。`zone --set tombstone` 会被直接拒绝。
 6. **自检只用自己的临时库**：脚本开头 `export MEMTREE_DB=$(mktemp -d)/...`。别把外部 `MEMTREE_DB` 继承进去——历史上因此出现过 19 项假失败。
-7. **压缩不是剪切**：`compress` 只压细节，`decision/anchor/merge`、`outcome≠0`、`label∈{anchor,emotional}`、`pinned` **无论多老都不压**。改这段前先读 `is_conclusion()`:1205 —— 它就是「梯度的下限」。
+7. **压缩不是剪切**：`compress` 只压细节，`decision/anchor/merge`、`outcome≠0`、`label∈{anchor,emotional}`、`pinned` **无论多老都不压**。改这段前先读 `is_conclusion()`:1476 —— 它就是「梯度的下限」。
 
 ---
 

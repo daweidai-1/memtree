@@ -50,6 +50,8 @@ memtree log --brief --width 28                            # 时间轴速览（13
 
 补充：`recall "方案" --status any`（连已废弃的一起看，会标注）、`show <id>`（来龙去脉 + 覆盖链）、`verify <addr>`（地址校验正文）。
 
+`--at T` 问的是**T 那一刻的现状**（按 `gone_at` 判，命中读全文、同时回 `status`当时 / `status_now`现在 与 `as_of_stats`），不是「现在相关、时间靠近 T」；`t` 在未来的条目任何 `--at` 都不返回，`context` 里它们单独排在 `⏳` 段、不参与现状判定。
+
 ## context 输出怎么读
 
 ```text
@@ -112,5 +114,5 @@ memtree label <id> anchor|emotional|noise|clear    # 手动打标
 
 DB 默认 `./.workbuddy/memory/memtree.db`，用 `MEMTREE_DB` 覆盖（按项目分库）。
 
-自检 114 项：`bash scripts/selftest.sh`。
+自检 211 项（27 组）：`bash scripts/selftest.sh`。
 数学推导见 `references/theory.md`；表结构与状态机见 `references/schema.md`。

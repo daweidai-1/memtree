@@ -5,7 +5,7 @@
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Deps](https://img.shields.io/badge/dependencies-0-brightgreen)]()
-[![Self-test](https://img.shields.io/badge/self--test-114%2F114-success)]()
+[![Self-test](https://img.shields.io/badge/self--test-211%2F211-success)]()
 
 > A timeline-first memory layer for AI agents. Old state is superseded by time, not by an LLM vote. 530 bytes per memory, ~360 tokens per turn, zero dependencies.
 
@@ -228,13 +228,27 @@ $M graph --style git              # 输出 Mermaid 图
 - **原文不丢**：被压节点转 `status='archived'`、`blobs.hot=0`，并记 `rolled_into` 指向摘要节点；内容寻址还在，`show` / `verify <addr>` 仍可回溯。
 - `--heat X` 是热度门：只压「久没被碰过」的旧事件；`label=noise` 豁免热度门（加速淘汰）。
 
+### 删除是两段式，保护位在墓碑里也有效
+
+- **第一段只进墓碑区**：`purge` 把候选改成 `zone='tombstone'` + `tombstoned_at` + `purge_reason` —— 正文还在库里，但立刻从 `recall` 与 `context` 消失。冷却 `7` 天，`purge --apply` 期满才抹正文；`--restore <id>` 冷却期内撤回（正文从未删除，分区按时间重算）；`--now` 给隐私/错误开直通车（跳过冷却，但**不跳过**下面的引用计数与保护位）。
+- **三条硬拦**（`--apply` 与 `--now` 都要过）：①保护位 —— 同一地址上**任何一条**钉住就不抹，**墓碑区里的 `pinned` 也算**；②共享地址 —— 该地址上还有任何 `zone <> 'tombstone'` 的节点（active / superseded / archived 全算）就不抹，因为正文一字不差的两条记忆共用一个 `addr`，抹一条等于烧掉另一条；③墓碑里不许 `pin` —— 否则「先钉再删」能造出假保护位。
+- **计数归属**：同一地址既命中保护位又有活引用时**只计 `skipped_pinned`**，不重复计 `skipped_shared`。被跳过的条目仍留在墓碑区，下次 `--apply` 继续重试。
+- **孤儿正文**（全库没有任何节点引用）由 `purge --gc` 显式回收：只删 `blobs` 行、不删 `nodes` 行；墓碑节点仍算引用者，所以冷却期内不可能被当孤儿误删。`--dry-run` 先报能省多少。
+
+### 回溯问的是当时，不是现在
+
+- `recall --at T` 是**时点快照**：按 `gone_at`（「不再作为现状的时刻」）判定 T 那一刻谁是现状，而不是「现在相关、时间离 T 近」。每条命中同时给 `status`（当时）与 `status_now`（现在），两者会分叉（样例：`"status": "active", "status_now": "superseded"`）；`--at` 下命中读**全文**，不是「已转冷」占位。
+- `as_of_stats` 把口径摊开：`active` 当时确实是现状 / `not_yet` T 之后才写入 / `already_gone` T 之前已失效 / `unknown_timing` 老数据没有 `gone_at`（迁移回填不到就留 NULL，不猜）。
+- **未来条目单独一段**：`⏳ 未来 N 条尚未发生（不参与现状判定）`。它们不进 `■` 现状、不许把真实现状顶掉；被未来条目覆盖的现状按 `gone_at > now` 补回并标 `(覆盖者在未来·此刻仍是现状)`，正文强制读原文。`context --json` 的 `total` 里多一个 `future`。
+- **未来条目不免疫压缩**：热度按 `max(accessed_at, min(t, now))` 算（否则 2030 年的一处笔误永久热度 1.0、永远压不动），`--keep-detail` 的「最新」也只认**已发生**的最新。
+
 ### 命令速查
 
 | 命令 | 作用 |
 |---|---|
 | `commit` | 写入；`--subject --event --importance --outcome --type --ts --refs --pin` |
-| `context` | 生成压缩记忆块；`--budget 650 --recent 3 --json --verbose` |
-| `recall` | 定位；`--at --outcome --days --event --mode --status --top` |
+| `context` | 生成压缩记忆块；`--budget 650 --recent 3 --json --verbose`（正文另有 `⏳` 未来段，`--json` 的 `total.future`） |
+| `recall` | 定位；`--at T` 时点快照（按 `gone_at` 判当时现状，带 `as_of_stats`）、`--outcome --days --event --mode --status --top` |
 | `log` | 时间轴；`--brief` 精简、`--all` 含归档 |
 | `show` / `verify` | 详情 + 覆盖链 / 地址校验 |
 | `branch` / `checkout` / `merge` | 分叉 / 切换 / 合并归档 |
@@ -242,8 +256,8 @@ $M graph --style git              # 输出 Mermaid 图
 | `label` / `pin` | 手动打标签 / 保护位开关 |
 | `zone` | 分区：看分布 / `--migrate` 单向降级 / `--id <n> --set hot` 显式升级 |
 | `compress` | 事件内细节梯度：`--days 30 --before --min-count 3 --keep-detail 1 --heat --text --branch`；越新越细、结论必留 |
-| `purge` | 两段式删除：默认进墓碑区冷却 `7天` → `--apply` 期满真删；`--now` 隐私立删；`--list` / `--restore <id>` / `--reason` |
-| `graph` / `stats` / `export` | 出图 / 统计 / 导出 |
+| `purge` | 两段式删除：默认进墓碑区冷却 `7天` → `--apply` 期满真删；`--now` 隐私立删；`--list` / `--restore <id>` / `--reason` / `--addr` / `--gc [--dry-run]`（回收孤儿正文） |
+| `graph` / `stats` / `export` | 出图 / 统计（含 `blobs.orphans`、`tombstone.pending/due`）/ 导出 |
 
 DB 默认 `./.workbuddy/memory/memtree.db`，用 `MEMTREE_DB` 覆盖（按项目分库）。
 
@@ -269,7 +283,7 @@ DB 默认 `./.workbuddy/memory/memtree.db`，用 `MEMTREE_DB` 覆盖（按项目
 bash scripts/selftest.sh
 ```
 
-114 项（24 组），覆盖：时间覆盖 / 乱序补录 / 三维检索 / 内容寻址 / 分支 / context 预算 / 压缩 / 压缩梯度（`--keep-detail` 与结论必留）/ 物理清除 / 出图 / 参数校验 / 未来时间戳 / 保护位 / 硬锚点 / 非 ASCII 向量 / 热度计时器。
+211 项（27 组），覆盖：时间覆盖 / 乱序补录 / 三维检索 / 内容寻址 / 分支 / context 预算 / 压缩 / 压缩梯度（`--keep-detail` 与结论必留）/ 物理清除 / 出图 / 参数校验 / 未来时间戳 / 保护位 / 硬锚点 / 非 ASCII 向量 / 热度计时器 / 事件层 / 五档分区 / 墓碑两段式 / 删除路径加固（保护位·共享地址·墓碑 pin）/ `recall --at` 时点快照与未来条目隔离。
 
 ```
 [1] 时间权重覆盖（越新越大）        ok ×4
@@ -296,7 +310,9 @@ bash scripts/selftest.sh
 [22] 老库补 zone/importance 并回填    ok ×3
 [23] 墓碑区：删除两段式              ok ×18
 [24] 事件内细节梯度压缩（结论必留）   ok ×20
-通过 114 / 失败 0
+[25] 删除路径加固（保护位/共享地址）  ok ×38
+[26] recall --at 时点快照 / 未来条目  ok ×36
+通过 211 / 失败 0
 ```
 
 ---
@@ -316,11 +332,11 @@ memory-timeline/
 │   └── memtree.cmd       # Windows 入口
 ├── references/
 │   ├── theory.md         # 数学推导（复平面模型、打分分解、时间旅行）
-│   ├── schema.md         # 表结构、状态机、压缩梯度（§5.5）、subject 命名、换真嵌入
+│   ├── schema.md         # 表结构、状态机、压缩梯度（§5.5）、两段式删除（§5.6）、gone_at（§5.7）、recall --at（§5.8）、未来条目（§5.9）、subject 命名、换真嵌入
 │   └── prompts.md        # 注入模板与抽取提示词
 └── scripts/
     ├── memtree.py        # 全部实现，单文件，零依赖
-    └── selftest.sh       # 114 项自检
+    └── selftest.sh       # 211 项自检（27 组）
 ```
 
 ---

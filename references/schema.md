@@ -11,6 +11,11 @@
 | `addr` | `sha256(正文)[:16]`，主键。相同内容天然去重 |
 | `content` | 正文。`purge` 后置空 |
 | `hot` | `1`=热（参与检索/上下文）`0`=冷（只可按地址取回）`2`=已清除 |
+| `nbytes` | 正文字节数，只服务 `purge --gc` 的「能省多少」估算 |
+
+正文**去重但不连坐**：`hot=0` 只能落在「全库没有活节点共用这个地址」时（`_cold_blob()`）——两条一字不差的记忆共用一个 `addr`，覆盖掉其中一条绝不能把另一条的正文一起转冷。
+
+孤儿正文（全库没有任何节点引用，任何 zone/status 都不引用）由 `purge --gc` 显式回收：只删 `blobs` 行、不删任何 `nodes` 行，`--dry-run` 先报数。「墓碑区里的节点仍算引用者」——冷却期内必须能 `--restore` 撤回，所以它们不可能是孤儿。
 
 ### nodes（索引，不含正文）
 
@@ -23,12 +28,13 @@
 | `v_text` | 128 维事件向量（稠密 ±1 随机投影，必须非稀疏） |
 | `type` | `event/fact/pref/decision/anchor/hypothesis/summary/merge` |
 | `scope` | `global`（跨分支共享）/ `branch` |
-| `factor` | 墓碑/压缩标记，`曾:美式@09-15`；压缩摘要记 `压:09-01~09-20/3条` |
+| `factor` | 墓碑/压缩标记，`曾:美式@09-15`；压缩摘要记 `压:9-01~09-20/3条` |
 | `meta` | JSON。压缩摘要节点记 `{"rolled":N,"ids":[…],"event":"…","kept_detail":[…]}`，其它路径留空 |
 | `rolled_into` | 被 `compress` 压进哪条 `summary` 节点的 id。NULL = 没被压过 |
 | `refs` | 被强化次数（仅记录，不参与权重） |
 | `supersedes` / `superseded_by` | 覆盖链双向指针 |
 | `status` | `active / superseded / archived`（`competing` 为保留值，当前无写入路径） |
+| `gone_at` | REAL，「**不再作为现状**」的时刻。写在被覆盖者身上：`commit` 记覆盖者的 `t`、`anchor` 覆盖记新锚点的 `t`、`merge`/`archive`/`compress` 记动作墙钟。`recall --at` 靠它判「T 那一刻谁是现状」；NULL = 时间未知（见 §5.7） |
 | `branch` / `parent_id` | 分支与 DAG 前驱 |
 | `pinned` | INTEGER 0/1，保护位。1 = context 永不裁剪、compress 永不覆盖、purge 拒绝硬删 |
 | `tombstoned_at` | REAL，进墓碑区的时刻。`now - tombstoned_at >= 7天` 才允许 `purge --apply` 真删 |
@@ -71,8 +77,10 @@
      ├── merge 分支成员 ─────────────► archived
      │
      └── compress 压掉的旧细节 ──────► archived（rolled_into → 摘要节点，正文 hot=0）
-                                         │
-                                    purge│
+
+  任意 zone/status 的候选 ──purge──► zone='tombstone'（正文仍在库，已从检索/上下文消失）
+                                         │ 冷却 7 天（PURGE_COOLDOWN_DAYS），--restore 可撤回
+                                         │ purge --apply（期满才真删，唯一不可逆入口）
                                          ▼
                                    正文清除，地址悬空（hot=2）
 ```
@@ -80,7 +88,9 @@
 - 只有 `active` 进 `context` 的 `■`。
 - `superseded` 只以 `factor` 出现在新记忆的括号里。
 - `purged` 的地址仍可用于**去重**和"曾经有过这条"的溯源，但取不回原文。
-- `pinned=1` 的节点不参与任何降级：`compress` 跳过它，`purge` 直接拒绝（要清先 `pin <id> --off`）。
+- `pinned=1` 的节点不参与任何降级：`compress` 跳过它，`purge` 直接拒绝（要清先 `pin <id> --off`）。**墓碑区里的保护位照样有效** —— `pinned_refs()` 不看 zone，同一地址上任何一条钉住，整条地址就不抹正文（§5.6）。
+- `tombstone` 是 **zone 不是 status**：进墓碑区的节点仍带着 `active/superseded/archived`，只是被排除出检索与上下文；`tombstoned_at` 起算 7 天后才允许 `--apply` 抹正文。
+- 反过来，**墓碑里不许打保护位**（`pin` 拒绝，提示先 `purge --restore`）：否则谁都能临时钉一下再删，保护位就成了假动作（§5.6 硬拦③）。
 - `competing` 是保留状态位：用于「两条现状互相矛盾、等用户裁决」的场景，目前没有写入路径，`recall --status competing` 恒为空。
 - `compress` 只动**细节**：被压的细节转 `archived` 并在 `rolled_into` 记住去处，结论节点原样留在 `active`——见 §5.5。
 
@@ -105,7 +115,7 @@
 | 不是分支 `fork_node` / `head_id` | 分叉点与 HEAD 被引用，压掉就断开历史 |
 | `zone != 'archive'` | 归档区已压过一轮 |
 | `pinned=0` | 保护位永不进压缩（SPEC §5.4） |
-| `--heat` 未给，或 `label='noise'`，或 `heat_of(r) <= --heat` | 热度门：只压「久没被碰过」的；`noise` 豁免是加速淘汰，不是放宽标准 |
+| `--heat` 未给，或 `label='noise'`，或 `t > now`，或 `heat_of(r) <= --heat` | 热度门：只压「久没被碰过」的；`noise` 豁免是加速淘汰，不是放宽标准；**未来条目走同一条快车道** —— 按 `min(t, now)` 算它是「刚写上去」，热度恒 1.0，若因此豁免就会出现「2030 年的事件永久免疫压缩」（§5.9） |
 
 ### 分组与梯度
 
@@ -148,6 +158,160 @@ or outcome != 0 or label in (anchor, emotional)
 
 `conclusions_preserved` 是被识别为结论、因而**没被压**的节点 id —— 它是「这次压缩没吃掉结论」的证据行。
 
+## 5.6 删除：两段式（SPEC §5.5）
+
+删除是不可逆的决定，所以拆成两段：**先进墓碑区，期满才抹正文**。中间这几天是唯一的后悔窗口。
+
+| 调用 | 作用 |
+|---|---|
+| `purge` | 整批进墓碑区：`status IN ('superseded','archived')` 且 `pinned=0` 且 `type != anchor` 且 `zone != 'tombstone'` |
+| `purge --addr <前缀>` | 按地址进墓碑区（该地址上的节点一起进）；地址上有保护位或锚点 → 整次调用直接拒绝 |
+| `purge --list` | 看墓碑排队、理由与剩余天数 `days_left` |
+| `purge --apply` | **唯一的不可逆入口**：期满才抹正文 |
+| `purge --restore <id>` | 冷却期内撤回（正文从未删除，分区按时间重算） |
+| `purge --now` | 跳过冷却立即删：隐私 / 错误信息（跳过冷却 ≠ 跳过引用计数与保护位） |
+| `purge --gc [--dry-run]` | 回收孤儿正文：只删 `blobs` 行，**不删任何 `nodes` 行** |
+| `--reason "<理由>"` | 记进 `purge_reason`，删完也保留（事后审计要能回答「谁为什么删的」） |
+
+进墓碑区只是 `zone='tombstone'` + `tombstoned_at` + `purge_reason`：正文还在库里，但已从 `recall` 与 `context` 消失。冷却期常量 `PURGE_COOLDOWN_DAYS = 7.0`。
+
+### 三条硬拦（`--apply` 与 `--now` 都要过）
+
+| # | 硬拦 | 判据 | 计数 |
+|---|---|---|---|
+| ① | 保护位 | `pinned_refs(addr) > 0` —— **同一地址上任何一条钉住都算，墓碑区里的 pinned 也算** | `skipped_pinned` |
+| ② | 共享地址 | `live_refs(addr) > 0` —— 该地址上还有 `zone != 'tombstone'` 的节点（`active / superseded / archived` 全算活引用） | `skipped_shared` |
+| ③ | 墓碑里不许 pin | `cmd_pin()` 直接拒绝进墓碑区的节点，提示先 `purge --restore <id>` | 报错退出 |
+
+- ②的理由是内容寻址：两条一字不差的记忆共用一个 `addr`，抹掉一条就等于销毁另一条的正文 —— 地址是共享资产，不是私产。
+- ③的理由是第①条：如果墓碑里能 pin，任何人都能「先钉一下再删」制造假保护位，或者反过来用「先删再钉」绕过①。两条一起才闭环。
+- **计数归属**：同一地址既命中原保护位又有活引用时，**只计 `skipped_pinned`**，不重复计 `skipped_shared`（代码里 pinned 先判并 `continue`）。
+- 被跳过的条目**仍留在墓碑区**（`due` 一直为真），下次 `--apply` 会重试；`--apply` 本身不累积状态、不删节点行。
+- `still_waiting = 墓碑总数 - due 数`：冷却还没满的那批。
+
+### 输出字段
+
+| 路径 | 字段 |
+|---|---|
+| 进墓碑区 | `tombstoned` / `cooldown_days` / `due_at`；无候选时 `{"tombstoned":0,"note":"没有可删的候选"}` |
+| `--list` | `tombstones` / `items[{id,subject,reason,days_left,due}]` |
+| `--apply` | `purged` / `due` / `skipped_pinned` / `skipped_shared` / `still_waiting` |
+| `--now` | `purged_now` / `skipped_pinned` / `skipped_shared` / `reason` / `cooldown_skipped: true` |
+| `--restore` | `restored` |
+| `--gc` | `gc_removed` / `bytes`；`--dry-run` 另有 `would_remove` |
+
+### 真实输出（临时库实跑）
+
+```console
+$ memtree purge --reason "草稿清理"
+{"tombstoned": 2, "cooldown_days": 7.0, "due_at": "2026-11-02", "note": "正文仍在库、已从检索与上下文消失；冷却期内 purge --restore <id> 撤回"}
+$ memtree purge --apply          # 冷却未满
+{"purged": 0, "due": 0, "skipped_pinned": 0, "skipped_shared": 0, "still_waiting": 2, "note": "冷却期满才真删：正文清除，只留悬空地址；保护位/仍被引用的地址不抹正文"}
+$ memtree purge --apply          # 期满
+{"purged": 2, "due": 2, "skipped_pinned": 0, "skipped_shared": 0, "still_waiting": 0, "note": "冷却期满才真删：正文清除，只留悬空地址；保护位/仍被引用的地址不抹正文"}
+$ memtree purge --now --addr 5d1c… --reason "口误含密码"
+{"purged_now": 1, "skipped_pinned": 0, "skipped_shared": 0, "reason": "口误含密码", "cooldown_skipped": true, "note": "立即删除：隐私/错误信息不需要冷却，删除不可恢复；保护位/仍被引用的地址不抹正文"}
+$ memtree purge --restore 5
+{"restored": 5, "note": "冷却期内撤回：正文从未删除，分区按时间重算"}
+```
+
+共享地址的真样例（`user.a` 的旧版与 `user.b` 的正文一字不差，共用 `addr=a6009f96ebf790c0`）：
+
+```console
+$ memtree purge                  # 只收 superseded/archived → 只把 user.a 旧版送进墓碑
+{"tombstoned": 1, ...}
+$ memtree purge --apply          # 期满，但同地址上 user.b 还活着
+{"purged": 0, "due": 1, "skipped_pinned": 0, "skipped_shared": 1, "still_waiting": 0, "note": "冷却期满才真删：正文清除，只留悬空地址；保护位/仍被引用的地址不抹正文"}
+```
+
+正文仍在 `blobs`（`('a6009f96ebf790c0', 0, 9)`，`hot=0` 未变 `2`）—— 这就是②存在的意义。
+
+> **诚实标注**：走正常 CLI 路径摸不到 `skipped_pinned` —— `pin` 拒绝墓碑区节点，`purge` 又拒绝带保护位的节点，所以「同一地址既命中保护位又有活引用」只可能出现在**老库或直连 SQL 改写过的数据**上。自检 [25] 就是直接构造这种数据来验计数归属。
+
+## 5.7 `gone_at`：现状失效时刻
+
+`status` 只回答「现在是不是现状」，回答不了「**2020 年 6 月那一刻**它是不是现状」。`gone_at` 补的就是这一格。
+
+写在**被覆盖者**身上，值是「它不再作为现状的那一刻」：
+
+| 动作 | `gone_at` 取什么 |
+|---|---|
+| `commit` 覆盖同 subject 的旧条目 | 覆盖者自己的 `t`（不是墙钟 —— 补录历史时墙钟会撒谎） |
+| `anchor` 覆盖 | 新锚点的 `t` |
+| `archive` / `merge` / `compress` | 动作发生的墙钟 |
+
+- 老库迁移：`_migrate()` 补 `gone_at REAL` 列后回填一次 —— `superseded` 取 `superseded_by` 那条的 `t`，`archived` 取 `rolled_into` 那条的 `t`。
+- **回填不到就留 NULL**，不猜。NULL 的条目在任何 `--at` 里都无法判定「当时是不是现状」：按当前 `status` 处理，并计进 `as_of_stats.unknown_timing` —— 宁可承认时间未知，也不假装确定。
+- 现值条目（`active` 且没人覆盖）`gone_at` 为 NULL，这是正常状态，不计入 `unknown_timing`（它还没失效过）。
+
+## 5.8 `recall --at`：时点快照
+
+`recall --at T` 问的是「**T 那一刻的现状**」，不是「现在符合关键词、且时间靠近 T 的条目」。判据：
+
+| 情况 | 判定 |
+|---|---|
+| `gone_at` 存在且 `<= T` | 那时已经失效 → `already_gone`，不当作当时的现状 |
+| `gone_at` 存在且 `> T` | 那时还是现状 → `active`（当时口径） |
+| `gone_at` 为 NULL 且 `status` 不是 `active`/`competing` | 时间未知 → `unknown_timing`，按当前 `status` 处理 |
+| `t > T` | T 之后才写的 → `not_yet`，不算当时的现状 |
+| `t > now` | **真实未来条目，任何 `--at` 都不返回** |
+
+细节口径：
+
+- 每条命中同时给两个状态位：`status` = **当时**的状态、`status_now` = 现在的状态。两者会分叉（样例里 `"status": "active", "status_now": "superseded"`）。
+- `--at` 下命中**读全文**，不返回 `[地址 … 已转冷]` 占位 —— 回溯的时候给个占位符等于没回溯。
+- 噪声门在 `--at` 下按**语义重合 `se`** 判，不按总分 Σ：深回溯时 Σ 会被时间权重压到 1e-16，按 Σ 会把确凿的历史静默丢掉。代价是可能多返回低分条目，所以命中带 `low_confidence` / `overlap` 标注让调用方自己判断。
+- `--status auto` 在 `--at` 下剔除「当时不是现状」的条目；显式 `--status` 时按显式值来。
+
+`as_of` / `as_of_stats` 字段：
+
+| 字段 | 含义 |
+|---|---|
+| `as_of` | 回显传入的 `T`（ISO 日期） |
+| `as_of_stats.active` | 命中里「当时确实是现状」的条数 |
+| `as_of_stats.not_yet` | T 之后才写入、因而没参与的条数 |
+| `as_of_stats.already_gone` | T 之前就已失效、因而没参与的条数 |
+| `as_of_stats.unknown_timing` | `gone_at` 缺失、时间无法判定的条数 |
+| `note` | 固定口径说明 |
+
+真实输出（库：`住在南京` t=2020-06-01 已被 `搬到苏州` t=2030-06-01 覆盖）：
+
+```console
+$ memtree recall "南京" --at 2020-09-01 --json
+{"query": "南京", "t": "2020-09-01", "outcome": 0.0, "hits": [{"id": 1, "score": 0.152, "sem": 0.64, "time": 0.24, "out": 0.0, "status": "active", "status_now": "superseded", "subject": "user.city", "event": null, "zone": "hot", "addr": "201320d1d96a57be", "overlap": 1.0, "low_confidence": false, "content": "住在南京", "ts": "2020-06-01"}], "as_of": "2020-09-01", "as_of_stats": {"active": 1, "not_yet": 1, "already_gone": 0, "unknown_timing": 0}, "note": "as_of 口径：按「覆盖/归档发生的时刻」(gone_at) 判定当时状态；T 之后才发生的现状类条目不算当时现状；gone_at 缺失的老数据按当前 status 处理并计入 unknown_timing"}
+```
+
+## 5.9 未来条目：还没发生的不算现状
+
+写错的未来时间戳（把 2026 打成 2030）不许霸榜，也不许把真实现状顶掉。
+
+| 位置 | 行为 |
+|---|---|
+| `context` 正文 | 另起一段：`⏳ 未来 N 条尚未发生（不参与现状判定） —— 显式查：recall --at <该日期之后> 或 log --all` |
+| `context` 的 `■` 现状 | 未来条目**永不进**；它盖不住真实现状 |
+| 被未来条目覆盖掉的现状 | 按 `gone_at > now` 补回 `■` 现状，行尾标 `(覆盖者在未来·此刻仍是现状)`，且正文强制读原文（不显示「已转冷」占位） |
+| `context --json` | `total` 新增 `future` |
+| 热度 `heat_of()` | `last = max(accessed_at, min(t, now))` —— 未来的 `t` 不让衰减起点跑进未来（否则 2030 那条永久热度 1.0） |
+| `compress` | 未来条目按 `t > now` 直接放行热度门（快车道，与 `noise` 同理）：`min(t, now)` 让它看起来「刚写上去」，若因此豁免就会出现「2030 年的事件永久免疫压缩」 |
+| `compress --keep-detail` | 「最新」= **已发生的最新**：未来条目不许抢占原文详情位 |
+
+真实输出（`住在南京` 2020-06-01 + `搬到苏州` 2030-06-01）：
+
+```console
+$ memtree context
+【记忆 2026-10-26 | main#2 | 2节点·废1】
+■ user.city: 住在南京  (覆盖者在未来·此刻仍是现状)
+※ ⚓锚点 ■现状 ▣事件轴 ⟦事件名⟧ ❄冷 🪦墓碑 ★钉=保护位 ◇假设 ○分支(回顾点) ·事件
+⏳ 未来 1 条尚未发生（不参与现状判定） —— 显式查：recall --at <该日期之后> 或 log --all
+```
+
+## 5.10 自检覆盖的契约（[25] / [26]）
+
+| 组 | 条数 | 断言的契约 |
+|---|---|---|
+| `[25]` 删除路径加固 | 38 | 保护位挡住 `--apply`（含墓碑区内的 pinned）；共享地址不抹正文；`--addr` 遇保护位/锚点整次拒绝；墓碑区不许 `pin`；冷却未满不删；期满真删后正文为空、`hot=2`、节点行仍在；`--restore` 分区按时间重算；`--now` 跳过冷却但**不跳过**引用计数；**计数归属**：同一地址同时命中时只计 `skipped_pinned`、不重复计 `skipped_shared`；被跳过的正文仍活着 |
+| `[26]` 时点快照 / 未来隔离 | 36 | `--at` 返回「T 那一刻是现状」的条目、不返回 T 之后才写的；T 之前已被覆盖的条目不当现状；`--at` 早于全部条目 → 空命中而不是拿后写的冒充；`status`(当时)/`status_now`(现在) 分叉；`--at` 下读全文非占位；`as_of` 回显、`as_of_stats` 四个键齐全；深回溯按 `se` 判而不被 Σ 饿死（带 `low_confidence`/`overlap`）；`context` 出 `⏳` 段且 `■` 不含未来条目；被未来覆盖者按 `gone_at > now` 补回并标 `(覆盖者在未来·此刻仍是现状)`；`total.future`；未来条目不免疫压缩 |
+
 ## 6. 权重
 
 ```
@@ -163,7 +327,7 @@ w = 2^(-|Δt|/45天)      Δt = t_q - t        t_q = 检索时刻（默认 now�
 | 概念 | 存在哪 | 决定什么 | 不决定什么 |
 |---|---|---|---|
 | 时间权重 `w` | 现算，不落盘 | 检索排序、context 里谁在前 | 谁进上下文（那由 status + pinned 决定） |
-| 热度 `heat` | `max(accessed_at, t)` 现算 | **只触发压缩**（`compress --heat`） | 排序、分区归属、压缩后去向 |
+| 热度 `heat` | `max(accessed_at, min(t, now))` 现算（未来条目不跑进未来） | **只触发压缩**（`compress --heat`） | 排序、分区归属、压缩后去向 |
 | 采样 `signals` | `signals` 表 | 攒出「值得升保护位」的证据 | 任何即时决策（要等 `settle`） |
 | 保护位 `pinned` | `nodes.pinned` | 不被裁剪 / 不被压缩 / 不被硬删 | 排序（保护位不抬权重，只保命） |
 | 锚点 `type=anchor` | 一条普通节点 | 独立成段、永不裁剪、撞上更新的 fact 时标 `⚑锚点未变` | 吞掉新现状（新 fact 照样 active，只标出张力） |
