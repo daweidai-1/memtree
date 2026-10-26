@@ -1202,7 +1202,24 @@ def cmd_graph(conn, a):
 
 
 # ------------------------------------------------------------------ 压缩 / 维护
+def is_conclusion(r):
+    """「结论必留」（SPEC §5 ①）：结论是「这事到底怎么定」的那一句，压掉它等于记忆没了。
+
+    判据不看措辞、看类型与结果：decision、带明确结果值的、锚点/情感标签、保护位。
+    细节可以越老越粗，结论无论多老都必须保持原样 —— 这是梯度的下限。
+    """
+    return (r["type"] in ("decision", "anchor", "merge") or r["pinned"]
+            or abs(float(r["outcome"] or 0.0)) > 0.0
+            or (r["label"] in ("anchor", "emotional")))
+
+
 def cmd_compress(conn, a):
+    """事件内细节梯度压缩（SPEC §5 ①）：越新越细，结论必留。
+
+    旧实现把一个分支里所有旧事件糊成一条摘要 —— 细节和结论一起没了，
+    再想问「当时为什么这么定」就只能靠悬空地址。现在按事件分组：
+    同事件内最新 keep_detail 条细节保留原文，更老的压成一行，结论永远不动。
+    """
     cut = parse_ts(a.before).timestamp() if a.before else datetime.now().timestamp() - a.days * 86400
     br = a.branch or head_branch(conn)
     keep = set()
@@ -1211,7 +1228,10 @@ def cmd_compress(conn, a):
     # pinned 走不到这层压缩：保护位永远只做 1~2 级压缩，不自动归档（SPEC §5.4）
     t_now = datetime.now().timestamp()
     rows = [r for r in _rows(conn)
-            if r["status"] == "active" and r["type"] == "event" and r["t"] < cut
+            if r["status"] == "active" and r["t"] < cut
+            # 候选=事件本身，或带事件标签的条目：压缩必须在事件内部做，
+            # 跨事件糊成一条就丢掉了「哪个结论属于哪件事」这层结构
+            and (r["type"] == "event" or r["event"]) and r["type"] != "summary"
             and r["branch"] == br and r["id"] not in keep and not r["pinned"]
             # 归档区已经压过一轮了：再压一次只会得到摘要的摘要，信息不可逆丢失
             and (r["zone"] or "hot") != "archive"
@@ -1220,27 +1240,49 @@ def cmd_compress(conn, a):
             # label='noise' 是结算产物：只有重复提及、没到情绪/确认阈值。
             # 它豁免热度门 —— 不是放宽标准，而是加速淘汰（§3.3）。
             and (a.heat is None or r["label"] == "noise" or heat_of(r, t_now) <= a.heat)]
-    if len(rows) < a.min_count:
-        emit(conn, {"compressed": 0, "candidates": [r["id"] for r in rows]})
-        return
-    texts = [content_of(conn, r["addr"]) for r in rows]
-    span = f"{short_date(rows[0]['t'])}~{short_date(rows[-1]['t'])}"
-    body = a.text or f"[压缩{len(rows)}条] " + "；".join(clip(t, 12) for t in texts[:4]) + ("…" if len(rows) > 4 else "")
-    addr = _put_blob(conn, body)
-    t0 = rows[0]["t"]
-    cur = conn.execute(
-        """INSERT INTO nodes(t,outcome,subject,addr,v_text,type,scope,factor,
-                             status,branch,parent_id,meta,ts_iso)
-           VALUES(?,0,NULL,?,?,'summary','global',?, 'active',?,?,?,?)""",
-        (t0, addr, pack_real(text_vec(body)),
-         f"压:{span}/{len(rows)}条", br, rows[0]["parent_id"],
-         json.dumps({"rolled": len(rows), "ids": [r["id"] for r in rows]}), now_iso()))
-    sid = cur.lastrowid
-    for r in rows:
-        conn.execute("UPDATE nodes SET status='archived', rolled_into=? WHERE id=?", (sid, r["id"]))
-        conn.execute("UPDATE blobs SET hot=0 WHERE addr=?", (r["addr"],))
+    concl = [r for r in rows if is_conclusion(r)]
+    detail = [r for r in rows if not is_conclusion(r)]
+
+    groups = {}
+    for r in sorted(detail, key=lambda r: (r["t"], r["id"])):
+        groups.setdefault((r["event"] or r["subject"] or f"#{r['id']}"), []).append(r)
+
+    done, skipped = [], []
+    for key, rs in groups.items():
+        keep_n = max(0, min(a.keep_detail, len(rs)))
+        to_zip = rs[: len(rs) - keep_n] if keep_n else rs      # 最新的 keep_n 条留原文
+        if len(to_zip) < a.min_count:
+            skipped.append({"event": key, "candidates": len(to_zip),
+                            "why": f"可压 {len(to_zip)} 条 < --min-count {a.min_count}"})
+            continue
+        texts = [content_of(conn, r["addr"]) for r in to_zip]
+        span = f"{short_date(to_zip[0]['t'])}~{short_date(to_zip[-1]['t'])}"
+        body = a.text or (f"[压缩{len(to_zip)}条] " + "；".join(clip(t, 12) for t in texts[:4])
+                          + ("…" if len(to_zip) > 4 else ""))
+        addr = _put_blob(conn, body)
+        evl = to_zip[-1]["event"]
+        cur = conn.execute(
+            """INSERT INTO nodes(t,outcome,subject,addr,v_text,type,scope,factor,
+                                 status,branch,parent_id,meta,ts_iso,event)
+               VALUES(?,0,?,?,?,'summary','global',?, 'active',?,?,?,?,?)""",
+            (to_zip[0]["t"], evl or to_zip[0]["subject"], addr, pack_real(text_vec(body)),
+             f"压:{span}/{len(to_zip)}条", br, to_zip[0]["parent_id"],
+             json.dumps({"rolled": len(to_zip), "ids": [r["id"] for r in to_zip],
+                         "event": evl, "kept_detail": [r["id"] for r in rs[len(rs) - keep_n:]]}),
+             now_iso(), evl))
+        sid = cur.lastrowid
+        for r in to_zip:
+            conn.execute("UPDATE nodes SET status='archived', rolled_into=? WHERE id=?", (sid, r["id"]))
+            conn.execute("UPDATE blobs SET hot=0 WHERE addr=?", (r["addr"],))
+        done.append({"event": key, "summary_node": sid, "compressed": len(to_zip),
+                     "span": span, "text": body,
+                     "kept_detail": [r["id"] for r in rs[len(rs) - keep_n:]]})
     conn.commit()
-    emit(conn, {"summary_node": sid, "rolled": len(rows), "span": span, "text": body})
+    emit(conn, {"groups": done, "compressed": sum(d["compressed"] for d in done),
+                "conclusions_preserved": [r["id"] for r in concl],
+                "skipped": skipped,
+                "note": "事件内梯度：最新 --keep-detail 条留原文、更老的压成一行、结论（decision/带结果/"
+                        "锚点/保护位）无论多老都不压"})
 
 
 def cmd_zone(conn, a):
@@ -1461,9 +1503,11 @@ def main(argv=None):
     s.add_argument("--style", default="git", choices=["git", "flow"])
     s.add_argument("--all", action="store_true")
 
-    s = add("compress", cmd_compress, "旧事件压缩成摘要")
+    s = add("compress", cmd_compress, "事件内细节梯度压缩：越新越细，结论必留")
     s.add_argument("--before"); s.add_argument("--days", type=int, default=30)
     s.add_argument("--min-count", type=int, default=3); s.add_argument("--text")
+    s.add_argument("--keep-detail", type=int, default=1,
+                   help="同一事件内保留原文细节的条数（最新 N 条），更老的压成一行摘要")
     s.add_argument("--heat", type=float,
                    help="热度门（0~1）：只压缩热度低于该值的候选；不填则只按时间裁")
     s.add_argument("--branch", help="默认跟随当前 HEAD（原实现写死 main，exp 分支的旧事件永远压不到）")

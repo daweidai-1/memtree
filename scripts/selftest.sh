@@ -80,9 +80,11 @@ LEN=$(printf %s "$OUT" | wc -c)
 echo "$OUT" | grep -qE "^■ t.coffee: 改喝拿铁" && { PASS=$((PASS+1)); echo "  ok   现状行正确"; } || { FAIL=$((FAIL+1)); echo "  FAIL 现状行"; }
 
 echo "[7] 压缩"
-for i in 1 2 3; do $M commit "旧事件$i" --type event --ts "2026-08-0${i}T10:00:00+08:00" -q >/dev/null; done
+for i in 1 2 3; do $M commit "旧事件$i" --type event --event 旧事件轴 --ts "2026-08-0${i}T10:00:00+08:00" -q >/dev/null; done
 $M commit "当前进展" --type event -q >/dev/null
-$M compress --days 40 --min-count 3 >/dev/null
+# 本用例表达的是「一个事件内的候选全部被压」：显式 --keep-detail 0 才退化成全压，
+# 默认 keep-detail 1 会留最新一条原文（梯度语义，见 [24]）。
+$M compress --days 40 --min-count 3 --keep-detail 0 >/dev/null
 chk "生成 summary" "c.execute(\"select count(*) from nodes where type='summary'\").fetchone()[0]==1"
 chk "旧事件不再 active" "c.execute(\"select count(*) from nodes where status='active' and addr in (select addr from blobs where content like '旧事件%')\").fetchone()[0]==0"
 
@@ -139,11 +141,12 @@ echo "[15] 热度只做压缩计时器"
 $M commit "五月的老事件 方案Q" --type event --ts "2026-05-01T10:00:00+08:00" -q >/dev/null
 $M recall "方案Q" >/dev/null
 chk "accessed_at 已记录" "c.execute(\"select count(*) from nodes where accessed_at is not null\").fetchone()[0]>=1"
-$M compress --days 30 --min-count 1 --heat 0.5 >/dev/null
+$M compress --days 30 --min-count 1 --heat 0.5 --keep-detail 0 >/dev/null
 chk "刚被召回的老事件不被压缩" "c.execute(\"select count(*) from nodes where type='summary'\").fetchone()[0]==0"
 $M commit "从没被碰过的四月老事件 方案R" --type event --ts "2026-04-01T10:00:00+08:00" -q >/dev/null
 $M commit "当前进展" --type event -q >/dev/null
-$M compress --days 30 --min-count 1 --heat 0.5 >/dev/null
+# 同上：本用例验的是热度门，所以显式全压（--keep-detail 0），让唯一变量只剩热度
+$M compress --days 30 --min-count 1 --heat 0.5 --keep-detail 0 >/dev/null
 chk "久未访问的老事件被压缩" "c.execute(\"select count(*) from nodes where type='summary'\").fetchone()[0]==1"
 
 echo "[16] 采样 → 结算 → 打标签（动态因子的第二职责）"
@@ -161,7 +164,8 @@ chk "只有重复提及判成 noise" "c.execute('select label from nodes where i
 chk "noise 不拿保护位" "c.execute('select pinned from nodes where id=$IDB').fetchone()[0]==0"
 chk "结算留了审计行" "c.execute('select count(*) from settle_log').fetchone()[0]>=2"
 chk "信号结算后清空" "c.execute('select count(*) from signals where settled=0').fetchone()[0]==0"
-$M compress --days 30 --min-count 1 --heat 0.1 >/dev/null
+# 本用例验的是 noise 豁免热度门，同样显式全压，别让 keep-detail 混进来
+$M compress --days 30 --min-count 1 --heat 0.1 --keep-detail 0 >/dev/null
 chk "noise 豁免热度门被压缩" "c.execute('select status from nodes where id=$IDB').fetchone()[0]=='archived'"
 chk "anchor 不被压缩" "c.execute('select status from nodes where id=$IDA').fetchone()[0]=='active'"
 
@@ -304,5 +308,62 @@ chk "--now 跳过冷却，立即真删（隐私没有缓冲期）" "c.execute(\"
 chk "stats 报墓碑待删/到期数" "c.execute(\"select count(*) from nodes where zone='tombstone'\").fetchone()[0]>=2"
 
 echo
+echo "[24] 事件内细节梯度压缩（SPEC §5 ①：越新越细，结论必留）"
+export MEMTREE_DB="$(mktemp -d)/mt_selftest3.db"
+$M init >/dev/null
+# E1：4 条细节（同一事件，越新越细）+ 4 条「再老也不能压」的结论
+D1=$($M commit "E1 细节一 最早" --type event --event E1 --ts "2026-03-01T10:00:00+08:00" -q)
+$M commit "E1 细节二" --type event --event E1 --ts "2026-03-02T10:00:00+08:00" -q >/dev/null
+D3=$($M commit "E1 细节三" --type event --event E1 --ts "2026-03-03T10:00:00+08:00" -q)
+D4=$($M commit "E1 细节四 最新必须原文留着" --type event --event E1 --ts "2026-03-04T10:00:00+08:00" -q)
+CD=$($M commit "E1 结论 拍板用方案甲" --type decision --event E1 --ts "2026-02-01T10:00:00+08:00" -q)
+CO=$($M commit "E1 结论 上线成功 延迟达标" --type event --event E1 --outcome 0.8 --ts "2026-02-02T10:00:00+08:00" -q)
+CL=$($M commit "E1 老事但带情感标签" --type event --event E1 --ts "2026-02-03T10:00:00+08:00" -q)
+CA=$($M commit "E1 老事但带锚点标签" --type event --event E1 --ts "2026-02-04T10:00:00+08:00" -q)
+CP=$($M commit "E1 老事但有保护位" --type event --event E1 --ts "2026-02-05T10:00:00+08:00" -q)
+# E2：另一个事件，同样 4 条细节 —— 用来证明两个事件不会被糊成一条 summary
+$M commit "E2 细节一" --type event --event E2 --ts "2026-03-01T11:00:00+08:00" -q >/dev/null
+$M commit "E2 细节二" --type event --event E2 --ts "2026-03-02T11:00:00+08:00" -q >/dev/null
+$M commit "E2 细节三" --type event --event E2 --ts "2026-03-03T11:00:00+08:00" -q >/dev/null
+$M commit "E2 细节四 最新" --type event --event E2 --ts "2026-03-04T11:00:00+08:00" -q >/dev/null
+# label 用 CLI 打会连带把保护位置 1（就绕过了 is_conclusion 的 label 分支），
+# 所以这里直接落 label、清保护位 —— 要验的是「label=anchor/emotional 也算结论」这条判据本身。
+"$PY" - "$MEMTREE_DB" "$CL" "$CA" "$CP" <<'EOF'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+c.execute("update nodes set label='emotional', pinned=0 where id=?", (int(sys.argv[2]),))
+c.execute("update nodes set label='anchor',    pinned=0 where id=?", (int(sys.argv[3]),))
+c.execute("update nodes set pinned=1 where id=?", (int(sys.argv[4]),))
+c.commit()
+EOF
+# 分支 head 本身不进候选池（正在写的这条不能被压走），所以先落一条「今天」的进展把 head 挪开
+$M commit "当前进展" --type event -q >/dev/null
+COUT=$($M compress --days 1 --min-count 3)
+chk "同一事件里更老的 3 条细节被归档" "c.execute(\"select count(*) from nodes where event='E1' and type!='summary' and status='archived'\").fetchone()[0]==3"
+chk "归档的细节 rolled_into 指向本事件的 summary" "c.execute(\"select rolled_into from nodes where id=$D1\").fetchone()[0]==c.execute(\"select id from nodes where type='summary' and event='E1'\").fetchone()[0]"
+chk "被压细节的正文转冷 hot=0（不是删了）" "c.execute(\"select b.hot from nodes n join blobs b on n.addr=b.addr where n.id=$D3\").fetchone()[0]==0"
+chk "同事件最新的 1 条细节保持 active" "c.execute(\"select status from nodes where id=$D4\").fetchone()[0]=='active'"
+chk "保留细节的正文逐字原样" "c.execute(\"select b.content from nodes n join blobs b on n.addr=b.addr where n.id=$D4\").fetchone()[0]=='E1 细节四 最新必须原文留着'"
+chk "summary 带着原事件标签 E1（事件轴不断）" "c.execute(\"select count(*) from nodes where type='summary' and event='E1'\").fetchone()[0]==1"
+chk "summary 正文写明压了几条" "c.execute(\"select b.content from nodes n join blobs b on n.addr=b.addr where n.type='summary' and n.event='E1'\").fetchone()[0].startswith('[压缩3条]')"
+chk "两个事件各自成条，没被合并成一条 summary" "c.execute(\"select count(*) from nodes where type='summary'\").fetchone()[0]==2 and c.execute(\"select count(*) from nodes where type='summary' and event='E2'\").fetchone()[0]==1"
+chk "结论 type=decision 再老也 active" "c.execute(\"select status from nodes where id=$CD\").fetchone()[0]=='active'"
+chk "结论 outcome!=0 再老也 active" "c.execute(\"select status from nodes where id=$CO\").fetchone()[0]=='active'"
+chk "label=emotional 的旧事也是结论" "c.execute(\"select status from nodes where id=$CL\").fetchone()[0]=='active'"
+chk "label=anchor 的旧事也是结论" "c.execute(\"select status from nodes where id=$CA\").fetchone()[0]=='active'"
+chk "保护位的旧事根本没进候选池" "c.execute(\"select status from nodes where id=$CP\").fetchone()[0]=='active'"
+chk "结论一条都没被卷进 summary" "c.execute(\"select count(*) from nodes where id in ($CD,$CO,$CL,$CA) and rolled_into is not null\").fetchone()[0]==0"
+echo "$COUT" | grep -q '"conclusions_preserved"' && { PASS=$((PASS+1)); echo "  ok   输出 JSON 有 conclusions_preserved"; } || { FAIL=$((FAIL+1)); echo "  FAIL 输出缺 conclusions_preserved"; }
+CPL=$(echo "$COUT" | "$PY" -c "import json,sys;print(','.join(map(str,sorted(json.load(sys.stdin)['conclusions_preserved']))))")
+[ "$CPL" = "$CD,$CO,$CL,$CA" ] && { PASS=$((PASS+1)); echo "  ok   conclusions_preserved 正好是那 4 条结论"; } || { FAIL=$((FAIL+1)); echo "  FAIL conclusions_preserved=[$CPL]"; }
+echo "$COUT" | grep -q '"compressed": 6' && { PASS=$((PASS+1)); echo "  ok   只压了细节 6 条（E1 3 + E2 3）"; } || { FAIL=$((FAIL+1)); echo "  FAIL compressed 计数不对"; }
+# --keep-detail 0：显式要求退化回「全压」，同事件一条细节都不留
+for i in 1 2 3; do $M commit "E3 细节$i" --type event --event E3 --ts "2026-03-0${i}T12:00:00+08:00" -q >/dev/null; done
+$M commit "当前进展" --type event -q >/dev/null
+$M compress --days 1 --min-count 3 --keep-detail 0 >/dev/null
+chk "--keep-detail 0 时退化为全压（E3 无 active 细节，只剩 summary）" "c.execute(\"select count(*) from nodes where event='E3' and type!='summary' and status='active'\").fetchone()[0]==0 and c.execute(\"select count(*) from nodes where event='E3' and type!='summary'\").fetchone()[0]==3"
+chk "--keep-detail 0 仍各事件各一条 summary" "c.execute(\"select count(*) from nodes where type='summary' and event='E3'\").fetchone()[0]==1"
+chk "第二轮压缩不碰上一轮留下的最新细节" "c.execute(\"select status from nodes where id=$D4\").fetchone()[0]=='active'"
+
 echo "通过 $PASS / 失败 $FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
