@@ -5,7 +5,7 @@
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Deps](https://img.shields.io/badge/dependencies-0-brightgreen)]()
-[![Self-test](https://img.shields.io/badge/self--test-292%2F292-success)]()
+[![Self-test](https://img.shields.io/badge/self--test-304%2F304-success)]()
 
 > A timeline-first memory layer for AI agents. Old state is superseded by time, not by an LLM vote. 530 bytes per memory, ~360 tokens per turn, zero dependencies.
 
@@ -221,7 +221,7 @@ $M graph --style git              # 输出 Mermaid 图
 
 `compress` 不是「把旧事件糊成一行」，而是在**事件内部**做梯度：
 
-- **候选**只限「事件本身 / 带 `event` 标签的条目」，按 `event` 分组。`type=summary`、已在归档区、分支分叉点/HEAD、`pinned` 一律不进候选（`--branch` 默认跟随当前 HEAD，不再写死 `main`）。
+- **候选**只限「事件本身 / 带 `event` 标签的条目」，按 `event` 分组。默认按类型分档：普通 30 天、重要（`importance ≥ 0.7` 或保护位）90 天、情感锚点（`label='emotional'` 或 `type=anchor`）永不自动压缩；显式 `--days` / `--before` 会统一覆盖时间分档，但不绕过结论/保护位硬闸。`type=summary`、已在归档区、分支分叉点/HEAD、`pinned` 一律不进候选（`--branch` 默认跟随当前 HEAD，不再写死 `main`）。
 - **越新越细**：同事件内最新的 `--keep-detail N`（默认 1）条细节保留原文；更老的攒够 `--min-count`（默认 3）条才压成一条 `summary`，正文形如 `[压缩3条] 起步；选型；确定 5 分钟 K 线`（默认取前 4 条、每条截 12 字，`--text` 可整体覆盖）。
 - **时间不挪位**：摘要节点的 `t` 回填被压的最早那条，插回原时间位置；`event` 标签继承原事件 —— 事件轴 `▣ 名 起~止 n条` 不会被打断。
 - **结论必留**：`type ∈ {decision, anchor, merge}`、`outcome ≠ 0`、`label ∈ {anchor, emotional}`、`pinned` 的节点**无论多老都不压**（`is_conclusion()`）。梯度只压细节，不压「这事到底怎么定」。
@@ -264,7 +264,7 @@ $M graph --style git              # 输出 Mermaid 图
 | `label` / `pin` | 手动打标签 / 保护位开关 |
 | `persona` | 人格卡：`show [--json] [--at T]` / `set "…" --slot hard\|soft\|var [--force] [--reason]` / `drop "…" --slot … [--force]` / `log [--limit N] [--json]`（硬槽 `set`/`drop` 都要 `--force`，超预算按最旧挤出） |
 | `zone` | 分区：看分布 / `--migrate` 单向降级 / `--id <n> --set hot` 显式升级 |
-| `compress` | 事件内细节梯度：`--days 30 --before --min-count 3 --keep-detail 1 --heat --text --branch`；越新越细、结论必留 |
+| `compress` | 事件内细节梯度：默认普通 30 天 / 重要 90 天 / 情感锚点永不自动压缩；`--days N` / `--before` 统一覆盖分档，另有 `--min-count 3 --keep-detail 1 --heat --text --branch`；越新越细、结论必留 |
 | `purge` | 两段式删除：默认进墓碑区冷却 `7天` → `--apply` 期满真删；`--now` 隐私立删；`--list` / `--restore <id>` / `--reason` / `--addr` / `--gc [--dry-run]`（回收孤儿正文） |
 | `graph` / `stats` / `export` | 出图 / 统计（含 `blobs.orphans`、`tombstone.pending/due`）/ 导出 |
 
@@ -292,7 +292,7 @@ DB 默认 `./.workbuddy/memory/memtree.db`，用 `MEMTREE_DB` 覆盖（按项目
 bash scripts/selftest.sh
 ```
 
-292 项（30 组），覆盖：时间覆盖 / 乱序补录 / 三维检索 / 内容寻址 / 分支 / context 预算 / 压缩 / 压缩梯度（`--keep-detail` 与结论必留）/ 物理清除 / 出图 / 参数校验 / 未来时间戳 / 保护位 / 硬锚点 / 非 ASCII 向量 / 热度计时器 / 事件层 / 五档分区 / 墓碑两段式 / 删除路径加固（保护位·共享地址·墓碑 pin）/ `recall --at` 时点快照与未来条目隔离 / 去重不连坐与孤儿回收（`purge --gc`）/ 事件条目的时点有效性（契约 H·I）/ 人格卡三槽预算·原子写·`--at` 回看·context 集成（契约 J）。
+304 项（31 组），覆盖：时间覆盖 / 乱序补录 / 三维检索 / 内容寻址 / 分支 / context 预算 / 压缩 / 压缩梯度（`--keep-detail` 与结论必留）/ 物理清除 / 出图 / 参数校验 / 未来时间戳 / 保护位 / 硬锚点 / 非 ASCII 向量 / 热度计时器 / 事件层 / 五档分区 / 墓碑两段式 / 删除路径加固（保护位·共享地址·墓碑 pin）/ `recall --at` 时点快照与未来条目隔离 / 去重不连坐与孤儿回收（`purge --gc`）/ 事件条目的时点有效性（契约 H·I）/ 人格卡三槽预算·原子写·`--at` 回看·context 集成（契约 J）/ 分类型压缩阈值（普通 30 天·重要 90 天·情感锚点豁免）。
 
 ```
 [1] 时间权重覆盖（越新越大）        ok ×4
@@ -324,8 +324,9 @@ bash scripts/selftest.sh
 [27] 去重不连坐 + purge --gc 孤儿回收  ok ×23
 [28] 契约 H：事件条目时点有效性      ok ×20
 [29] 契约 I：事件行不打现状标记      ok ×15
-[30] 契约 J：人格卡三槽/--at/context  ok ×46
-通过 292 / 失败 0
+[30] 契约 J：人格卡三槽/--at/context  ok ×47
+[31] 分类型压缩阈值（SPEC §4.2）   ok ×11
+通过 304 / 失败 0
 ```
 
 ---
@@ -349,7 +350,7 @@ memory-timeline/
 │   └── prompts.md        # 注入模板与抽取提示词
 └── scripts/
     ├── memtree.py        # 全部实现，单文件，零依赖
-    └── selftest.sh       # 292 项自检（30 组）
+    └── selftest.sh       # 304 项自检（31 组）
 ```
 
 ---

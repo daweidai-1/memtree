@@ -1,8 +1,8 @@
 # AUDIT —— 按 SPEC 逐节对照
 
-> 审计对象：本项目（v2.1，代码基线 **6ddb0d1**）在 2026-10 本轮改版后的状态。
+> 审计对象：本项目（v2.1，代码基线 **9124f20**）在 2026-10 本轮改版后的状态。
 > 验收标准：那份 12 节设计 SPEC（时间+事件二维图、五档分区、遗忘流水线、人格卡与三层锚点、情感层、上下文组装、落地选型、三条铁律、8 个待定参数）。
-> 证据行号全部指向 `scripts/memtree.py`（6ddb0d1 上 2,118 行，行号以该提交为准）。自检 `bash scripts/selftest.sh` → **通过 292 / 失败 0**（30 组）。
+> 证据行号全部指向 `scripts/memtree.py`（9124f20 上 2,134 行，行号以该提交为准；历史改动记录里的行号保留其当时提交口径）。自检 `bash scripts/selftest.sh` → **通过 304 / 失败 0**（31 组）。
 
 ## 一句话结论
 
@@ -25,8 +25,8 @@
 | §3 五档分区 | **已实现** | `nodes.zone`（hot/warm/cold/archive/tombstone）+ `zone_target()` + `zone --migrate` 单向降级；`blobs.hot` 0/1/2 是存储态 | 归档区磁盘配额、分区按分支差异化阈值没做 |
 | §4.1 热度=计时器 | **已实现** | `heat_of()`：只算「距上次访问」，绝不累计次数；`compress --heat` 是唯一消费者 | — |
 | §4.1 动态因子采样（本轮新增） | **已实现** | `signal` 采样 → `settle` 一次性结算 → `label` → `pinned`；`_judge()` 走规则不调 LLM；`settle_log` 留审计 | 情感摘要的 `emotion_tags` 尚未结构化落库（目前只存 `signals.quote`） |
-| §4.2 分类型压缩阈值 | **未实现** | 单一 `--days/--min-count/--heat` | 普通/重要/情感锚点三档阈值 |
-| §5 遗忘五级流水线 | **部分**（①②③⑤已做，④仍缺） | ①**事件内细节梯度**：`compress --keep-detail` 按 `event` 分组、组内最新 N 条留原文，`is_conclusion()` 强制结论必留（`is_conclusion()` :1476 / `cmd_compress()` :1487-1568）；②事件级合并 `compress`；③影响隔离（`superseded` 不进 context、`gone_at` 让 `--at` 能判当时）；⑤**两段式硬删除** `purge`：进墓碑区 → 冷却 7 天 → `--apply` 才抹正文，三条硬拦（保护位含墓碑内的 / 共享地址还有活引用 / 墓碑里不许 pin）在 `cmd_purge()` :1266-1384；保护位 `pinned` | ④归档区只是 `status='archived'`，默认不加载靠代码过滤而非独立存储；事件边界仍靠外部 Agent 给（会话分段未做）；没有事件级独立节点与事件级权重 |
+| §4.2 分类型压缩阈值 | **已实现**（T3，`9124f20`） | `cmd_compress()` :1754；默认普通 30 天 / 重要（`importance≥0.7` 或 `pinned`）90 天 / 情感锚点（`label='emotional'` 或 `type='anchor'`）永不自动压缩（`automatic_cut()` :1766-1772）；显式 `--days` / `--before` 统一覆盖时间分档（:1763-1764），但不绕过 `is_conclusion()` 与保护位；自检 [31] 11 条 | `pinned` 仍受更强的「保护位永不自动压缩」既有硬闸约束，不因重要档 90 天而解禁 |
+| §5 遗忘五级流水线 | **部分**（①②③⑤已做，④仍缺） | ①**事件内细节梯度**：`compress --keep-detail` 按 `event` 分组、组内最新 N 条留原文，`is_conclusion()` 强制结论必留（`is_conclusion()` :1743 / `cmd_compress()` :1754-1841）；②事件级合并 `compress`；③影响隔离（`superseded` 不进 context、`gone_at` 让 `--at` 能判当时）；⑤**两段式硬删除** `purge`：进墓碑区 → 冷却 7 天 → `--apply` 才抹正文，三条硬拦（保护位含墓碑内的 / 共享地址还有活引用 / 墓碑里不许 pin）在 `cmd_purge()` :1266-1384；保护位 `pinned` | ④归档区只是 `status='archived'`，默认不加载靠代码过滤而非独立存储；事件边界仍靠外部 Agent 给（会话分段未做）；没有事件级独立节点与事件级权重 |
 | §5.4 保护位 | **已实现** | `--pin` / `pin <id> --off`（`cmd_pin()` :610）；context 永不裁剪、compress 跳过、purge 拒绝，**墓碑区里的保护位同样挡硬删**（`pinned_refs()` :454 不看 zone） | — |
 | §6 人格卡 | **已实现**（本轮，契约 J/J11） | 独立文件 `<db>.persona.md`（`persona_path()` :529-532，`--persona-file` 覆盖）；三段固定标题 `## 硬槽`/`## 软槽`/`## 可变槽`（`PERSONA_TITLES` :63）、一行一条 `- `；预算硬 300/软 350/可变 150/整卡 800（`PERSONA_SLOT_BUDGET` :66、`PERSONA_TOTAL_BUDGET` :67，用 `est_tokens()` :202）；`cmd_persona()` :622-722 中硬槽 `set` 必须 `--force`（:653-655），硬槽 `drop` 同样必须 `--force`（:689-703，契约 J11），超预算硬槽直接拒、软/可变最旧优先挤出并留 `op=evict`（:662-669）、挤不动整条回滚 `exit 2`（:670-673）；`persona_log` 表（:302-310）记 add/del/evict，`persona show --at T` 正向重放（`persona_replay()` :607-619）；`cmd_context()` 在首行后、锚点前插 `⚓人格·硬/软/可变` 三行、计入 `--budget` 但永不裁剪（:1185-1193），`--json` 增 `persona`（:1233-1239）；原子写（`persona_save()` :576-590） | 没有版本化（不进 `blobs`、无快照、无审批流）、没有漂移检测；卡文件被手改不进日志 |
 | §6.4 冲突检测 | **部分** | 锚点与现状并存时打 ⚑ 标记，不静默覆盖 | 不落 `conflict` 状态，没有「候选取舍」流程 |
@@ -40,7 +40,7 @@
 | §10 铁律一（时间定位置、调用只微调） | **已实现** | `refs` 只记录，从不进排序；`accessed_at` 只喂热度 | — |
 | §10 铁律二（被问得多 ≠ 值得记住） | **已实现** | 热度不升区、不进 context、不参与排序；`repeat_mention` 单独结算成 `noise` 后加速淘汰 | — |
 | §10 铁律三（热度是计时器） | **已实现** | 见 §4.1。热度影响保留的唯一通道是 `settle` 的一次性结算——离散、留审计，不是连续延长寿命 | — |
-| §12 八个待定参数 | **部分** | 已定并落地：热度代理=距上次访问（乘性） | 未落地：分类型压缩阈值、秩位快照（没有秩位）、情感锚点豁免、分区天数与重要性下限、归档配额与清理、摘要用本地模型（人格卡 token 上限本轮已落地：300/350/150/整卡 800） |
+| §12 八个待定参数 | **部分** | 已定并落地：热度代理=距上次访问（乘性）、分类型压缩阈值（普通 30 / 重要 90 / 情感锚点豁免）、人格卡 token 上限（300/350/150/整卡 800） | 未落地：秩位快照（没有秩位）、分区天数与重要性下限、归档配额与清理、摘要用本地模型 |
 
 ## 本轮改了什么（对照旧版）
 
@@ -69,7 +69,9 @@
 | 21 | 自检 [26] 时点快照 / 未来隔离 **36 条** | scripts/selftest.sh | `--at` 三态判定、T 之后写的条目不当现状、T 之前已失效的不返回、`status`/`status_now` 分叉、`as_of` 回显、`as_of_stats` 四键、深回溯按语义重合 `se` 判而非 Σ（带 `low_confidence`/`overlap`）、`⏳` 段与补回行、`total.future`、未来条目不免疫压缩。（`45f9c42`） |
 | 22 | **去重不连坐 + 孤儿正文回收** | `_cold_blob()` :475 / `orphan_addrs()` :464 / `purge --gc [--dry-run]` / `cmd_stats.blobs.orphans` | 两个旧账一起收：①覆盖时对败者地址盲目标 `hot=0`，若胜者与它共用同一 `addr`（正文一字不差），胜者正文会被一起转冷 → 现在只在「全库没有活节点共用该地址」时才转冷；②`blobs` 里没人引用的正文此前永不释放 → `purge --gc` 显式回收（只删 `blobs` 行、不删 `nodes` 行；墓碑节点仍算引用者，冷却期内不可能被当孤儿）。（`146f5c5`） |
 | 23 | **人格卡 + 三层锚点预算**（SPEC §6，契约 J） | `persona_path()` :529-532 / `persona_load()` :535-556 / `persona_save()` :576-590（原子写）/ `persona_slot_tokens()` :572 / `cmd_persona()` :622-722 / `persona_log` 表 :302-310 / `PERSONA_SLOT_BUDGET` :66 / `PERSONA_TOTAL_BUDGET` :67 / `cmd_context()` :1184-1188、:1232 / CLI :2071-2105 | 人格卡落成**独立文件**（默认 `<db>.persona.md`，`--persona-file` 覆盖），三段固定标题 `## 硬槽`/`## 软槽`/`## 可变槽`、一行一条 `- `、空槽保留标题；预算用 `est_tokens()`（中文 1 字≈1.5）分三层 + 整卡兜底 800。写侧：**硬槽 `set` / `drop` 不给 `--force` 就改不动**（人格漂移不会自己回滚，`set` :653-655、`drop` :697-699）；硬槽超预算直接拒（不许挤别人），软/可变超预算按「最后一次写入最旧优先」挤出并留 `op=evict`，挤到只剩新条目仍超 → 整条回滚 `exit 2`；重复写幂等。审计侧：`persona_log(t,slot,op,old,new,reason)`，`op ∈ add|del|evict`，`persona show --at T` 从空卡正向重放（卡文件里只有「现在是什么」）。context 侧：卡非空时在首行之后、锚点之前插 `⚓人格·硬/软/可变` 三行（只出非空槽），计入 `--budget` 但**永不被裁**，卡为空时输出与没有人格卡逐字相同。`nodes` 不存人格条目，`--type anchor` 语义不变。（`12bbccb`） |
-| 24 | 自检 [30] 人格卡（契约 J）**46 条** | scripts/selftest.sh [30] | 空卡零输出（context 里不许出现 `⚓人格`）/ 硬槽 `--force` 闸且被拒时不落卡不落日志 / 软槽最旧挤出 + `op=evict` 留痕 / 硬槽超限不挤别人 / 整卡超 800 回滚且卡文件 sha256 不变 / `--at` 早于首次写入给 `(卡为空)`、两次写入之间给中间态 / 重复写幂等、`drop` 留 `op=del`、`drop` 不存在不报错 / `⚓人格` 行排在锚点之前且 `--budget` 极小时不被裁 / `context --json` 带三槽 + `est_tokens`。（本轮，`test-safety`） |
+| 24 | 自检 [30] 人格卡（契约 J）**47 条** | scripts/selftest.sh [30] | 空卡不出现 `⚓人格·*` 内容行（图例符号除外）/ 硬槽 `--force` 闸且被拒时不落卡不落日志 / 软槽最旧挤出 + `op=evict` 留痕 / 硬槽超限不挤别人 / 整卡超 800 回滚且卡文件 sha256 不变 / `--at` 早于首次写入给 `(卡为空)`、两次写入之间给中间态 / 重复写幂等、`drop` 留 `op=del`、`drop` 不存在不报错 / `⚓人格` 行排在锚点之前且 `--budget` 极小时不被裁 / `context --json` 带三槽 + `est_tokens` / 卡非空时图例行含 `⚓人格`（J12）。（本轮） |
+| 25 | **context 图例补 `⚓人格`**（契约 J12） | `legend` 常量 :1179 / scripts/selftest.sh [30] | 人格卡已经进 context 三行，但图例没教模型 `⚓人格` 是什么意思 —— 文档此前靠一句「常量还没改」替代码认错。现在图例与 SKILL 样例逐字一致，并用 J12 钉住「卡非空时图例行含 `⚓人格`」。改动文件：`scripts/memtree.py` + `scripts/selftest.sh`（T2 破例同轮）。（`09869c9`） |
+| 26 | **分类型压缩阈值**（SPEC §4.2） | `cmd_compress()` :1754 / `automatic_cut()` :1766-1772 / CLI `--days` 默认 None :2068 / scripts/selftest.sh [31] | 默认不再一刀切 30 天：普通 30 天；重要（`importance≥0.7` 或 `pinned`）90 天；`label='emotional'` 或 `type='anchor'` 永不自动压缩。显式 `--days` / `--before` 仍统一覆盖时间分档（老行为），但不绕过 `is_conclusion()` 与保护位。自检 [31] 11 条：三档边界、1000 天情绪/锚点仍 active、显式覆盖、缺 `importance` 老库可直接 compress。（`9124f20`） |
 
 ## 明确没做（别误以为有）
 
@@ -85,14 +87,14 @@
 
 1. **受控 subject 枚举**：在 SKILL.md 里给出枚举表并让抽取器只能选，不自由生成。这一条的收益大于剩下所有 bug 的总和。
 2. ~~事件层最小版~~（已完成：`event` 列 + 事件轴 + `recall --event` 剪枝）。剩下的：会话分段自动划事件边界、事件级权重、同类型事件秩位衰减。
-3. ~~`zone` 列 + 单向迁移器~~ ~~墓碑区 + 硬删除冷却期~~ ~~「压缩只压细节」（事件内细节梯度 + 结论必留）~~ ~~删除路径三条硬拦 + 契约 F 计数归属~~ ~~`recall --at` 时点快照（`gone_at`）~~ ~~未来条目隔离~~ ~~去重不连坐 + 孤儿正文回收~~（均已完成）。剩下：**归档区磁盘配额**。
+3. ~~`zone` 列 + 单向迁移器~~ ~~墓碑区 + 硬删除冷却期~~ ~~「压缩只压细节」（事件内细节梯度 + 结论必留）~~ ~~删除路径三条硬拦 + 契约 F 计数归属~~ ~~`recall --at` 时点快照（`gone_at`）~~ ~~未来条目隔离~~ ~~去重不连坐 + 孤儿正文回收~~ ~~分类型压缩阈值~~（均已完成）。剩下：**归档区磁盘配额**。
 4. **情感层独立表**：`affect(ts, emotion_tags, intensity, key_quote, event_id)`，会话内内存、结束时落一条；情感锚点用 `pinned + emotional_anchor` 双标记。
 5. ~~人格卡：单独文件 + token 上限 + 变更日志~~（已完成：`<db>.persona.md` + 300/350/150/800 + `persona_log`，见改动记录 #23）。剩下：**版本化**——卡的内容地址/快照、「谁批准改」的审批流、手改文件的检测。
 
 ## 怎么复核本文件
 
 ```bash
-bash scripts/selftest.sh          # 期望：通过 292 / 失败 0（30 组）
+bash scripts/selftest.sh          # 期望：通过 304 / 失败 0（31 组）
 python scripts/memtree.py context --budget 200   # 期望：末行有「⚠ 还有 N 条未展开」
 python scripts/memtree.py stats                   # 期望：有 protected 与 heat 两段
 ```
