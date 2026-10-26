@@ -5,7 +5,7 @@
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Deps](https://img.shields.io/badge/dependencies-0-brightgreen)]()
-[![Self-test](https://img.shields.io/badge/self--test-20%2F20-success)]()
+[![Self-test](https://img.shields.io/badge/self--test-114%2F114-success)]()
 
 > A timeline-first memory layer for AI agents. Old state is superseded by time, not by an LLM vote. 530 bytes per memory, ~360 tokens per turn, zero dependencies.
 
@@ -115,7 +115,7 @@ addr = sha256(content)[:16]
 | `log` 默认（含地址/权重） | 622 token |
 | `show` 单条 | 87 token |
 | `stats` 一次 | 180 token |
-| **SKILL.md（每次会话加载）** | **~2,130 token** |
+| **SKILL.md（每次会话加载）** | **3,221 token**（本轮压缩梯度段 +293） |
 
 > 数字用 `memtree.est_tokens()` 量的（中文 1.5 token/字、ASCII 0.3 token/字符），别拿 `len/1.4` 复现——那对中文低估 40% 以上。测量脚本的做法：建 22 条种子记忆（含锚点、保护位、emoji 各一条），把各命令的 stdout 灌进 `est_tokens()`。
 
@@ -134,7 +134,7 @@ addr = sha256(content)[:16]
 
 `SKILL.md` 每次会话都要加载。Agent 不像人，它每个新会话都从零开始 —— 所以"文档写得详细"在人眼里是优点，在 Agent 眼里是**每次会话都要重付的税**。
 
-本项目为此做过一次专项瘦身：`SKILL.md` 从 3,323 → **1,400 token 量级（−58%）**，数学推导移到 `references/theory.md` 按需读取，可用信息一条没少。之后补命令入口、锚点与保护位写法又长回来一些，当前实测 ~2,130 token——这份税按会话付一次，不再随对话长度涨。
+本项目为此做过一次专项瘦身：`SKILL.md` 从 3,323 → **1,400 token 量级（−58%）**，数学推导移到 `references/theory.md` 按需读取，可用信息一条没少。之后补命令入口、锚点与保护位写法又长回来一些：HEAD 实测 2,928 token，本轮补压缩梯度段再 +293 → **3,221 token**。这份税按会话付一次，不再随对话长度涨。
 
 ---
 
@@ -213,9 +213,20 @@ $M recall "方案" --status any                     # 连废弃的一起看（�
 # 维护
 $M log --brief                    # 时间轴速览
 $M show 12                        # 来龙去脉 + 覆盖链
-$M compress --days 30             # 旧事件压成一行摘要
+$M compress --days 30 --keep-detail 2   # 事件内细节梯度：越新越细、结论必留
 $M graph --style git              # 输出 Mermaid 图
 ```
+
+### 压缩是梯度，不是剪切
+
+`compress` 不是「把旧事件糊成一行」，而是在**事件内部**做梯度：
+
+- **候选**只限「事件本身 / 带 `event` 标签的条目」，按 `event` 分组。`type=summary`、已在归档区、分支分叉点/HEAD、`pinned` 一律不进候选（`--branch` 默认跟随当前 HEAD，不再写死 `main`）。
+- **越新越细**：同事件内最新的 `--keep-detail N`（默认 1）条细节保留原文；更老的攒够 `--min-count`（默认 3）条才压成一条 `summary`，正文形如 `[压缩3条] 起步；选型；确定 5 分钟 K 线`（默认取前 4 条、每条截 12 字，`--text` 可整体覆盖）。
+- **时间不挪位**：摘要节点的 `t` 回填被压的最早那条，插回原时间位置；`event` 标签继承原事件 —— 事件轴 `▣ 名 起~止 n条` 不会被打断。
+- **结论必留**：`type ∈ {decision, anchor, merge}`、`outcome ≠ 0`、`label ∈ {anchor, emotional}`、`pinned` 的节点**无论多老都不压**（`is_conclusion()`）。梯度只压细节，不压「这事到底怎么定」。
+- **原文不丢**：被压节点转 `status='archived'`、`blobs.hot=0`，并记 `rolled_into` 指向摘要节点；内容寻址还在，`show` / `verify <addr>` 仍可回溯。
+- `--heat X` 是热度门：只压「久没被碰过」的旧事件；`label=noise` 豁免热度门（加速淘汰）。
 
 ### 命令速查
 
@@ -230,7 +241,7 @@ $M graph --style git              # 输出 Mermaid 图
 | `signal` / `settle` | 采样入队 / 一次性结算成 label（带审计） |
 | `label` / `pin` | 手动打标签 / 保护位开关 |
 | `zone` | 分区：看分布 / `--migrate` 单向降级 / `--id <n> --set hot` 显式升级 |
-| `compress` | 旧事件压缩成摘要 |
+| `compress` | 事件内细节梯度：`--days 30 --before --min-count 3 --keep-detail 1 --heat --text --branch`；越新越细、结论必留 |
 | `purge` | 两段式删除：默认进墓碑区冷却 `7天` → `--apply` 期满真删；`--now` 隐私立删；`--list` / `--restore <id>` / `--reason` |
 | `graph` / `stats` / `export` | 出图 / 统计 / 导出 |
 
@@ -248,7 +259,7 @@ DB 默认 `./.workbuddy/memory/memtree.db`，用 `MEMTREE_DB` 覆盖（按项目
 4. **`subject` 是命门。** 写错或写不一致，覆盖直接失效，退化成"一堆并列记忆"。这是唯一的失败入口。
 5. **短对话不划算。** 累计成本交叉点在 25 轮左右，低于此用它纯亏。
 
-**一个已知的理论限制**：压缩保留的是结论，不是推理链。"选了方案 B" 脱离"当时 A 有内存泄漏"就无法支撑后续推理。这是所有摘要式记忆的通病，memtree 不免疫——缓解办法是把关键前提写成独立 `commit`，而不是塞进摘要。
+**一个已知的理论限制**：压缩保留的是结论，不是推理链。"选了方案 B" 脱离"当时 A 有内存泄漏"就无法支撑后续推理。这是所有摘要式记忆的通病，memtree 不免疫——缓解办法是把关键前提写成独立 `commit`（或 `--type decision`，它会命中「结论必留」），而不是塞进摘要。
 
 ---
 
@@ -258,7 +269,7 @@ DB 默认 `./.workbuddy/memory/memtree.db`，用 `MEMTREE_DB` 覆盖（按项目
 bash scripts/selftest.sh
 ```
 
-37 项，覆盖：时间覆盖 / 乱序补录 / 三维检索 / 内容寻址 / 分支 / context 预算 / 压缩 / 物理清除 / 出图 / 参数校验 / 未来时间戳 / 保护位 / 硬锚点 / 非 ASCII 向量 / 热度计时器。
+114 项（24 组），覆盖：时间覆盖 / 乱序补录 / 三维检索 / 内容寻址 / 分支 / context 预算 / 压缩 / 压缩梯度（`--keep-detail` 与结论必留）/ 物理清除 / 出图 / 参数校验 / 未来时间戳 / 保护位 / 硬锚点 / 非 ASCII 向量 / 热度计时器。
 
 ```
 [1] 时间权重覆盖（越新越大）        ok ×4
@@ -268,7 +279,7 @@ bash scripts/selftest.sh
 [5] 分支                            ok ×3
 [6] context 预算与图例              ok ×3
 [7] 压缩                            ok ×2
-[8] 物理清除                        ok ×1
+[8] 物理清除（两段式：先进墓碑区）    ok ×2
 [9] 出图                            ok ×2
 [10] 参数校验（脏值当场拒绝）         ok ×3
 [11] 未来时间戳不得霸榜              ok ×1
@@ -276,7 +287,16 @@ bash scripts/selftest.sh
 [13] 硬锚点（不被现状吞掉）          ok ×3
 [14] 非 ASCII（emoji/假名）           ok ×2
 [15] 热度只做压缩计时器              ok ×3
-通过 94 / 失败 0
+[16] 采样 → 结算 → 打标签            ok ×9
+[17] 角色扮演污染防护                ok ×3
+[18] 手动标签与升/降噪               ok ×3
+[19] 事件层（SPEC §2.2 最小版）      ok ×5
+[20] 老库升级不炸（缺列自动补）       ok ×3
+[21] 五档分区（时间单向降级）         ok ×12
+[22] 老库补 zone/importance 并回填    ok ×3
+[23] 墓碑区：删除两段式              ok ×18
+[24] 事件内细节梯度压缩（结论必留）   ok ×20
+通过 114 / 失败 0
 ```
 
 ---
@@ -285,19 +305,22 @@ bash scripts/selftest.sh
 
 ```
 memory-timeline/
-├── SKILL.md              # Agent 入口（~2,100 token，精简到只留操作信息）
+├── SKILL.md              # Agent 入口（3,221 token，精简到只留操作信息）
 ├── README.md             # 本文件
+├── AUDIT.md              # 按 SPEC 逐节对照：哪节做了、哪节明确没做、下一期建议
+├── PROJECT_STATE.md      # 跨会话进度台账：能力状态表、未实现清单、安装态、接手指南
+├── DESIGN.md             # 早期设计稿（思路存档；与实现冲突时以 AUDIT.md 为准）
 ├── LICENSE               # MIT
 ├── bin/
 │   ├── memtree           # POSIX 入口（MEMTREE_PY → python3 → python → py）
 │   └── memtree.cmd       # Windows 入口
 ├── references/
 │   ├── theory.md         # 数学推导（复平面模型、打分分解、时间旅行）
-│   ├── schema.md         # 表结构、状态机、subject 命名、换真嵌入的方法
+│   ├── schema.md         # 表结构、状态机、压缩梯度（§5.5）、subject 命名、换真嵌入
 │   └── prompts.md        # 注入模板与抽取提示词
 └── scripts/
     ├── memtree.py        # 全部实现，单文件，零依赖
-    └── selftest.sh       # 94 项自检
+    └── selftest.sh       # 114 项自检
 ```
 
 ---

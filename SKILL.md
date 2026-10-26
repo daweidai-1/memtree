@@ -101,11 +101,16 @@ memtree label <id> anchor|emotional|noise|clear    # 手动打标
 
 `user_confirm`/`correction` → `anchor` 自动拿保护位；情绪峰值 ≥0.7 且 `stated` → `emotional`；只有重复提及 → `noise`（豁免热度门，加速淘汰）。判定全是规则、不调 LLM，详见 `references/schema.md`。
 
-`compress --days 30 [--heat 0.1]`：`--heat` 是热度门，只压"久没被碰过"的旧事件。
+`compress --days 30 [--min-count 3] [--heat 0.1] [--keep-detail 1]`：**事件内细节梯度**，越新越细（SPEC §5 ①）。
+
+- 候选只限「事件本身 / 带 `event` 标签的条目」，按 `event` 分组，**不跨事件合并**；同事件内最新 `--keep-detail` 条细节留原文，更老的够 `--min-count` 条才压成一条 `summary` —— 正文 `[压缩3条] 片段；片段；…`，`t` 回填最早那条、`event` 继承，事件轴不断。
+- **结论必留**：`decision/anchor/merge`、`outcome≠0`、`label∈{anchor,emotional}`、`pinned` 的节点无论多老都不压。
+- 被压原文不丢：`status=archived` + `blobs.hot=0` + `rolled_into`，内容地址仍可 `show` / `verify` 回溯。
+- `--heat` 是热度门，只压"久没被碰过"的旧事件；`label=noise` 豁免（加速淘汰）。`--text` 覆盖摘要正文，`--before` 指定截止时刻。
 
 `branch try-1 --from 5` 分叉 · `checkout try-1` 切换 · `merge try-1 --summary "…"` 合并并归档
 
 DB 默认 `./.workbuddy/memory/memtree.db`，用 `MEMTREE_DB` 覆盖（按项目分库）。
 
-自检 94 项：`bash scripts/selftest.sh`。
+自检 114 项：`bash scripts/selftest.sh`。
 数学推导见 `references/theory.md`；表结构与状态机见 `references/schema.md`。

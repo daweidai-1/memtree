@@ -23,7 +23,9 @@
 | `v_text` | 128 维事件向量（稠密 ±1 随机投影，必须非稀疏） |
 | `type` | `event/fact/pref/decision/anchor/hypothesis/summary/merge` |
 | `scope` | `global`（跨分支共享）/ `branch` |
-| `factor` | 墓碑/压缩标记，`曾:美式@09-15` |
+| `factor` | 墓碑/压缩标记，`曾:美式@09-15`；压缩摘要记 `压:09-01~09-20/3条` |
+| `meta` | JSON。压缩摘要节点记 `{"rolled":N,"ids":[…],"event":"…","kept_detail":[…]}`，其它路径留空 |
+| `rolled_into` | 被 `compress` 压进哪条 `summary` 节点的 id。NULL = 没被压过 |
 | `refs` | 被强化次数（仅记录，不参与权重） |
 | `supersedes` / `superseded_by` | 覆盖链双向指针 |
 | `status` | `active / superseded / archived`（`competing` 为保留值，当前无写入路径） |
@@ -68,7 +70,7 @@
      │
      ├── merge 分支成员 ─────────────► archived
      │
-     └── compress 覆盖的旧事件 ──────► archived
+     └── compress 压掉的旧细节 ──────► archived（rolled_into → 摘要节点，正文 hot=0）
                                          │
                                     purge│
                                          ▼
@@ -80,6 +82,71 @@
 - `purged` 的地址仍可用于**去重**和"曾经有过这条"的溯源，但取不回原文。
 - `pinned=1` 的节点不参与任何降级：`compress` 跳过它，`purge` 直接拒绝（要清先 `pin <id> --off`）。
 - `competing` 是保留状态位：用于「两条现状互相矛盾、等用户裁决」的场景，目前没有写入路径，`recall --status competing` 恒为空。
+- `compress` 只动**细节**：被压的细节转 `archived` 并在 `rolled_into` 记住去处，结论节点原样留在 `active`——见 §5.5。
+
+## 5.5 压缩：事件内细节梯度（SPEC §5 ①）
+
+`compress` 的唯一职责是**在事件内部**降细节密度，不做跨事件的糊合。三段流水线：
+
+```
+候选筛选 → 按 event 分组 → 组内梯度（最新 keep_detail 条留原文 / 更老的压一行）
+                              ↘ 结论命中 is_conclusion() 的节点整组跳过
+```
+
+### 候选
+
+`status='active'` 且 `t < --before`（或 `now - --days`，默认 30 天），并且：
+
+| 条件 | 说明 |
+|---|---|
+| `type='event'` 或 `event` 非空 | 压缩必须在事件内部做，跨事件糊成一条就丢了「哪个结论属于哪件事」 |
+| `type != 'summary'` | 摘要的摘要不可逆丢信息 |
+| `branch = --branch`（默认当前 HEAD） | 旧实现写死 `main`，侧枝的旧事件永远压不到 |
+| 不是分支 `fork_node` / `head_id` | 分叉点与 HEAD 被引用，压掉就断开历史 |
+| `zone != 'archive'` | 归档区已压过一轮 |
+| `pinned=0` | 保护位永不进压缩（SPEC §5.4） |
+| `--heat` 未给，或 `label='noise'`，或 `heat_of(r) <= --heat` | 热度门：只压「久没被碰过」的；`noise` 豁免是加速淘汰，不是放宽标准 |
+
+### 分组与梯度
+
+- 分组键 = `event` → `subject` → `#id` 兜底；组内按 `(t, id)` 升序。
+- `keep_n = min(--keep-detail, 组大小)`，**最新的 keep_n 条**留原文；其余吃梯度。
+- 待压条数 `< --min-count`（默认 3）→ 整组进输出 `skipped`，附 `why`。
+
+### 摘要节点
+
+| 字段 | 值 |
+|---|---|
+| `t` | 被压的第一条（最老）的 `t`，插回原时间位置，不移动 HEAD |
+| `type` / `scope` / `status` | `summary` / `global` / `active` |
+| `event` | 继承原事件标签 → 事件轴 `▣ 名 起~止 n条` 不被打断 |
+| `factor` | `压:<起>~<止>/N条` |
+| `meta` | `{"rolled":N,"ids":[…],"event":"…","kept_detail":[…]}` |
+| 正文 | `--text` 覆盖，否则 `[压缩N条] ` + 前 4 条片段（每条截 12 字）以 `；` 连接，超出加 `…` |
+
+被压节点：`status='archived'`、`rolled_into=<摘要 id>`、`blobs.hot=0`。正文仍在 `blobs`，按地址可回溯。
+
+### 结论必留：梯度的下限
+
+`is_conclusion(r)` 为真即整条跳过，与年龄无关：
+
+```python
+type in (decision, anchor, merge) or pinned
+or outcome != 0 or label in (anchor, emotional)
+```
+
+判据不看措辞、看类型与结果 —— 「这事到底怎么定」压掉等于记忆没了；细节可以越老越粗，结论不行。
+
+### 输出（`--json`）
+
+```json
+{"groups":[{"event":"转岗","summary_node":41,"compressed":12,"span":"08-01~09-20",
+            "text":"[压缩12条] …","kept_detail":[55]}],
+ "compressed":12,"conclusions_preserved":[53],"skipped":[{"event":"搬家","candidates":2,"why":"…"}],
+ "note":"事件内梯度：…"}
+```
+
+`conclusions_preserved` 是被识别为结论、因而**没被压**的节点 id —— 它是「这次压缩没吃掉结论」的证据行。
 
 ## 6. 权重
 
