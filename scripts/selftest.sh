@@ -365,5 +365,177 @@ chk "--keep-detail 0 时退化为全压（E3 无 active 细节，只剩 summary�
 chk "--keep-detail 0 仍各事件各一条 summary" "c.execute(\"select count(*) from nodes where type='summary' and event='E3'\").fetchone()[0]==1"
 chk "第二轮压缩不碰上一轮留下的最新细节" "c.execute(\"select status from nodes where id=$D4\").fetchone()[0]=='active'"
 
+echo
+echo "[25] 删除路径加固（保护位 / 共享地址 / pin 墓碑）"
+# 契约：A 抹正文前先查引用计数（除墓碑区外任何 zone 都算活引用，含 archived/superseded）；
+# B --apply 候选必须 pinned=0；C pin 墓碑报错退出；D --apply 报 skipped_pinned/skipped_shared；
+# E --now 同样受 A 约束。这里全部直连临时库造历史状态，不靠实现自觉。
+jget() { "$PY" -c "import json,sys;d=json.load(sys.stdin);print(d.get('$1',''))"; }
+gechk() {  # gechk <实际值> <下限> <描述>
+  if [ -n "$1" ] && [ "$1" -ge "$2" ] 2>/dev/null; then
+    PASS=$((PASS+1)); echo "  ok   $3"
+  else
+    FAIL=$((FAIL+1)); echo "  FAIL $3 (实际='$1')"
+  fi
+}
+addr_of_id() { "$PY" - "$MEMTREE_DB" "$1" <<'EOF'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+print(c.execute("select addr from nodes where id=?", (int(sys.argv[2]),)).fetchone()[0])
+EOF
+}
+aged() { "$PY" - "$MEMTREE_DB" "$1" <<'EOF'
+import sqlite3, sys, time
+c = sqlite3.connect(sys.argv[1])
+c.execute("update nodes set tombstoned_at=? where id=?", (time.time() - 8 * 86400, int(sys.argv[2])))
+c.commit()
+EOF
+}
+
+# ---------- (1) 共享地址：两条活节点共用一份正文，删一条不能带走另一条 ----------
+export MEMTREE_DB="$(mktemp -d)/mt_selftest4.db"
+$M init >/dev/null
+S1=$($M commit "共享正文：预算批下来了" --type fact --subject sh.a --source stated -q | tail -1)
+S2=$($M commit "共享正文：预算批下来了" --type fact --subject sh.b --source inferred -q | tail -1)
+$M commit "预算后来被砍了" --type fact --subject sh.a -q >/dev/null   # 让 S1 变 superseded
+chk "两条不同 --source 的节点共用同一地址（内容寻址真的去重了）" "c.execute(\"select count(distinct addr) from nodes where id in ($S1,$S2)\").fetchone()[0]==1"
+SHADDR=$(addr_of_id "$S1")
+$M purge >/dev/null
+chk "批量 purge 只把被覆盖的 S1 送进墓碑区，S2 不受牵连" "c.execute(\"select zone from nodes where id=$S1\").fetchone()[0]=='tombstone' and c.execute(\"select zone from nodes where id=$S2\").fetchone()[0]!='tombstone'"
+aged "$S1"
+SOUT=$($M purge --apply)
+chk "共享地址仍有活引用 → 正文没被抹（这是不可恢复的数据丢失）" "c.execute(\"select length(content) from blobs where addr=?\", ('$SHADDR',)).fetchone()[0]>0"
+$M verify "$SHADDR" | grep -q '"sha256_ok": true' && { PASS=$((PASS+1)); echo "  ok   共享地址正文完好（sha256 未损）"; } || { FAIL=$((FAIL+1)); echo "  FAIL 共享地址正文被抹，sha256 校验崩了"; }
+SKS=$(echo "$SOUT" | jget skipped_shared)
+gechk "$SKS" 1 "输出 skipped_shared ≥ 1（D：共享地址不抹正文要能看见）"
+SNOTE=$(echo "$SOUT" | jget note)
+echo "$SNOTE" | grep -q "保护位" && echo "$SNOTE" | grep -q "引用" && { PASS=$((PASS+1)); echo "  ok   note 说明「保护位/仍被引用的地址不抹正文」"; } || { FAIL=$((FAIL+1)); echo "  FAIL note 没说清为什么不抹（note='$SNOTE'）"; }
+"$PY" - "$MEMTREE_DB" "$S2" <<'EOF'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+c.execute("update nodes set status='superseded' where id=?", (int(sys.argv[2]),))
+c.commit()
+EOF
+SOUT2=$($M purge --apply)
+chk "superseded 的活引用同样保护正文（转冷不等于删除）" "c.execute(\"select length(content) from blobs where addr=?\", ('$SHADDR',)).fetchone()[0]>0"
+
+# ---------- (2) 保护位：墓碑里的 pinned=1，冷却期满也不能抹 ----------
+export MEMTREE_DB="$(mktemp -d)/mt_selftest5.db"
+$M init >/dev/null
+P1=$($M commit "保护位正文：她生日 3 月 12 日" --type fact --subject pin.a -q | tail -1)
+$M commit "覆盖 pin.a" --type fact --subject pin.a -q >/dev/null
+$M purge >/dev/null
+"$PY" - "$MEMTREE_DB" "$P1" <<'EOF'
+import sqlite3, sys, time
+c = sqlite3.connect(sys.argv[1])
+c.execute("update nodes set pinned=1, tombstoned_at=? where id=?", (time.time() - 8 * 86400, int(sys.argv[2])))
+c.commit()
+EOF
+chk "造出历史状态：墓碑 + 保护位 + 已过冷却期" "c.execute(\"select zone,pinned from nodes where id=$P1\").fetchone()[:2]==('tombstone',1)"
+POUT=$($M purge --apply)
+chk "墓碑里的保护位在冷却期满后依然挡删（正文还在）" "c.execute(\"select length(b.content) from nodes n join blobs b on n.addr=b.addr where n.id=$P1\").fetchone()[0]>0"
+PKP=$(echo "$POUT" | jget skipped_pinned)
+gechk "$PKP" 1 "输出 skipped_pinned ≥ 1（手滑删了还能靠保护位救回来）"
+
+# ---------- (3) pin 墓碑必须报错：保护位在墓碑里没有效力，不能假装打得进去 ----------
+export MEMTREE_DB="$(mktemp -d)/mt_selftest6.db"
+$M init >/dev/null
+T1=$($M commit "临时口令 4321" --type event --subject pin.err -q | tail -1)
+TADDR=$(addr_of_id "$T1")
+$M purge --addr "$TADDR" --reason 隐私 >/dev/null
+PERR=$($M pin $T1 2>&1); PRC=$?
+[ "$PRC" -ne 0 ] && { PASS=$((PASS+1)); echo "  ok   pin 墓碑退出码非 0（当前 $PRC）"; } || { FAIL=$((FAIL+1)); echo "  FAIL pin 墓碑静默成功（退出码 0）"; }
+echo "$PERR" | grep -q "墓碑" && { PASS=$((PASS+1)); echo "  ok   报错提示是墓碑区"; } || { FAIL=$((FAIL+1)); echo "  FAIL 报错里没提墓碑（stderr='$PERR'）"; }
+chk "pin 失败后库里 pinned 仍是 0（没有留下假保护位）" "c.execute(\"select pinned from nodes where id=$T1\").fetchone()[0]==0"
+
+# ---------- (4) 正常删除回归：无共享无保护的墓碑到期，正文确实要抹 ----------
+export MEMTREE_DB="$(mktemp -d)/mt_selftest7.db"
+$M init >/dev/null
+Z1=$($M commit "单独正文：只有这一条引用" --type fact --subject solo.a -q | tail -1)
+$M commit "覆盖 solo.a" --type fact --subject solo.a -q >/dev/null
+$M purge >/dev/null
+aged "$Z1"
+ZOUT=$($M purge --apply)
+chk "正常删除回归：无共享无保护，冷却期满正文确实被抹、hot=2" "c.execute(\"select hot,content from blobs where addr=(select addr from nodes where id=$Z1)\").fetchone()[:2]==(2,'')"
+ZKP=$(echo "$ZOUT" | jget skipped_pinned); ZKS=$(echo "$ZOUT" | jget skipped_shared)
+chk "该删的没被拦住（skipped_pinned/skipped_shared 都是 0）" "'$ZKP'=='0' and '$ZKS'=='0'"
+ZP=$(echo "$ZOUT" | jget purged)
+gechk "$ZP" 1 "purged 计数 ≥ 1（删除路径没被整条挡死）"
+
+# ---------- (5) 转冷节点（status=archived、hot=0）仍算活引用 ----------
+export MEMTREE_DB="$(mktemp -d)/mt_selftest8.db"
+$M init >/dev/null
+R1=$($M commit "共享正文：压掉的也要能回溯" --type fact --subject cold.a -q | tail -1)
+R2=$($M commit "共享正文：压掉的也要能回溯" --type fact --subject cold.b -q | tail -1)
+$M commit "覆盖 cold.b" --type fact --subject cold.b -q >/dev/null
+$M purge >/dev/null
+chk "批量 purge 只把 R2 送进墓碑区，R1 还活着" "c.execute(\"select zone from nodes where id=$R1\").fetchone()[0]!='tombstone' and c.execute(\"select zone from nodes where id=$R2\").fetchone()[0]=='tombstone'"
+"$PY" - "$MEMTREE_DB" "$R1" "$R2" <<'EOF'
+import sqlite3, sys, time
+c = sqlite3.connect(sys.argv[1])
+r1, r2 = int(sys.argv[2]), int(sys.argv[3])
+c.execute("update nodes set status='archived', zone='cold' where id=?", (r1,))
+c.execute("update blobs set hot=0 where addr=(select addr from nodes where id=?)", (r1,))
+c.execute("update nodes set tombstoned_at=? where id=?", (time.time() - 8 * 86400, r2))
+c.commit()
+EOF
+chk "造出历史状态：R1 已转冷归档（hot=0），R2 墓碑到期" "c.execute(\"select status,zone from nodes where id=$R1\").fetchone()[:2]==('archived','cold')"
+CLADDR=$(addr_of_id "$R1")
+ROUT=$($M purge --apply)
+chk "转冷/归档节点仍算活引用 → 正文没被抹（回溯时还要读）" "c.execute(\"select length(content) from blobs where addr=?\", ('$CLADDR',)).fetchone()[0]>0"
+RKS=$(echo "$ROUT" | jget skipped_shared)
+gechk "$RKS" 1 "转冷引用也算 skipped_shared ≥ 1"
+
+# ---------- (6) --now：跳过冷却不等于跳过引用计数 ----------
+export MEMTREE_DB="$(mktemp -d)/mt_selftest9.db"
+$M init >/dev/null
+N1=$($M commit "共享正文：隐私场景" --type fact --subject now.a --source stated -q | tail -1)
+N2=$($M commit "共享正文：隐私场景" --type fact --subject now.b --source inferred -q | tail -1)
+$M commit "覆盖 now.a" --type fact --subject now.a -q >/dev/null
+NADDR=$(addr_of_id "$N1")
+$M purge --now --reason 隐私 >/dev/null
+chk "--now 确实把 N1 送进墓碑区（没整条跳掉）" "c.execute(\"select zone from nodes where id=$N1\").fetchone()[0]=='tombstone'"
+chk "--now 也查引用计数：N2 还活着就不抹正文" "c.execute(\"select length(content) from blobs where addr=?\", ('$NADDR',)).fetchone()[0]>0"
+U1=$($M commit "唯一引用：错误信息" --type fact --subject now.c -q | tail -1)
+$M commit "覆盖 now.c" --type fact --subject now.c -q >/dev/null
+$M purge --now --reason 隐私 >/dev/null
+chk "--now 唯一引用照删（隐私没有缓冲期）" "c.execute(\"select hot,content from blobs where addr=(select addr from nodes where id=$U1)\").fetchone()[:2]==(2,'')"
+
+
+# ---------- (7) 契约 F：该 addr 上有 pinned 节点（墓碑区里的也算）就不抹 ----------
+export MEMTREE_DB="$(mktemp -d)/mt_selftest10.db"
+$M init >/dev/null
+F1=$($M commit "共享正文：保护位落在墓碑里" --type fact --subject f.a --source stated -q | tail -1)
+F2=$($M commit "共享正文：保护位落在墓碑里" --type fact --subject f.b --source inferred -q | tail -1)
+$M commit "覆盖 f.a" --type fact --subject f.a -q >/dev/null
+$M commit "覆盖 f.b" --type fact --subject f.b -q >/dev/null
+$M purge >/dev/null
+chk "F 前置：两条共用同一地址的节点都进了墓碑区（墓碑外已无活引用）" "c.execute(\"select count(*) from nodes where id in ($F1,$F2) and zone='tombstone'\").fetchone()[0]==2 and c.execute(\"select count(distinct addr) from nodes where id in ($F1,$F2)\").fetchone()[0]==1"
+FADDR=$(addr_of_id "$F1")
+"$PY" - "$MEMTREE_DB" "$F1" <<'EOF'
+import sqlite3, sys, time
+c = sqlite3.connect(sys.argv[1])
+c.execute("update nodes set pinned=1 where id=?", (int(sys.argv[2]),))
+c.execute("update nodes set tombstoned_at=? where zone='tombstone'", (time.time() - 8 * 86400,))
+c.commit()
+EOF
+chk "F 前置：一条墓碑 pinned=1，两条都过冷却期" "c.execute(\"select count(*) from nodes where id in ($F1,$F2) and tombstoned_at is not null\").fetchone()[0]==2 and c.execute(\"select pinned from nodes where id=$F1\").fetchone()[0]==1"
+FOUT=$($M purge --apply)
+chk "F1：墓碑外无活引用，但地址上有 pinned → 正文仍在" "c.execute(\"select length(content) from blobs where addr=?\", ('$FADDR',)).fetchone()[0]>0"
+$M verify "$FADDR" | grep -q '"sha256_ok": true' && { PASS=$((PASS+1)); echo "  ok   F1：正文完好（sha256 未损）"; } || { FAIL=$((FAIL+1)); echo "  FAIL F1：正文被抹，sha256 校验崩了"; }
+FKP=$(echo "$FOUT" | jget skipped_pinned)
+gechk "$FKP" 1 "F1：保护位优先计入 skipped_pinned（同 addr 不重复计数）"
+chk "F1：判定按 addr 走 —— 同一地址的两条墓碑一条都没被抹" "c.execute(\"select count(*) from nodes n join blobs b on n.addr=b.addr where n.id in ($F1,$F2) and length(b.content)>0\").fetchone()[0]==2"
+"$PY" - "$MEMTREE_DB" "$F1" <<'EOF'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+c.execute("update nodes set pinned=0 where id=?", (int(sys.argv[2]),))
+c.commit()
+EOF
+FOUT2=$($M purge --apply)
+chk "F2 回归：保护位撤掉且墓碑外无活引用 → 正文确实被抹、hot=2" "c.execute(\"select hot,content from blobs where addr=?\", ('$FADDR',)).fetchone()[:2]==(2,'')"
+FKP2=$(echo "$FOUT2" | jget skipped_pinned)
+chk "F2 回归：这次 skipped_pinned 是 0（F 没把删除路径挡死）" "'$FKP2'=='0'"
+
 echo "通过 $PASS / 失败 $FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
