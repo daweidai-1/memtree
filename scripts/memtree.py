@@ -689,9 +689,14 @@ def cmd_persona(conn, a):
     if act == "drop":
         text = " ".join((a.text or "").split())
         slot = a.slot
-        if text not in slots[slot]:
+        if text not in slots[slot]:             # 幂等优先：no-op 不该因为缺 --force 变成报错
             emit(conn, {"changed": False, "note": "不存在，未改动"})
             return
+        # 契约 J11：防漂移不能只锁 set —— 一把 drop 就能把硬锚点删干净，等于把锁装在门上、
+        # 窗户敞着。判据与文案和 set 完全一致。
+        if slot == "hard" and not a.force:
+            print("[memtree] 硬槽改动需要 --force（防人格漂移）", file=sys.stderr)
+            sys.exit(2)
         cand = {k: list(slots[k]) for k in PERSONA_SLOTS}
         cand[slot] = [x for x in slots[slot] if x != text]
         persona_save(a, cand)
@@ -2090,9 +2095,9 @@ def main(argv=None):
     ps.add_argument("text"); ps.add_argument("--slot", required=True, choices=list(PERSONA_SLOTS))
     ps.add_argument("--force", action="store_true"); ps.add_argument("--reason")
 
-    ps = padd("drop", "删一条")
+    ps = padd("drop", "删一条（硬槽需 --force）")
     ps.add_argument("text"); ps.add_argument("--slot", required=True, choices=list(PERSONA_SLOTS))
-    ps.add_argument("--reason")
+    ps.add_argument("--force", action="store_true"); ps.add_argument("--reason")
 
     ps = padd("log", "人格改动审计（时间倒序）")
     ps.add_argument("--limit", type=int, default=20); ps.add_argument("--json", action="store_true")
