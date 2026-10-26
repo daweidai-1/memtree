@@ -537,5 +537,48 @@ chk "F2 回归：保护位撤掉且墓碑外无活引用 → 正文确实被抹�
 FKP2=$(echo "$FOUT2" | jget skipped_pinned)
 chk "F2 回归：这次 skipped_pinned 是 0（F 没把删除路径挡死）" "'$FKP2'=='0'"
 
+# ---------- (8) 计数归属：保护位与活引用重叠时优先计 skipped_pinned（--now 路径） ----------
+export MEMTREE_DB="$(mktemp -d)/mt_selftest11.db"
+$M init >/dev/null
+G1=$($M commit "共享正文：--now 也要看保护位" --type fact --subject g.a --source stated -q | tail -1)
+G2=$($M commit "共享正文：--now 也要看保护位" --type fact --subject g.b --source inferred -q | tail -1)
+GADDR=$(addr_of_id "$G1")
+"$PY" - "$MEMTREE_DB" "$G1" "$G2" <<'EOF'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+c.execute("update nodes set pinned=1 where id=?", (int(sys.argv[2]),))
+c.execute("update nodes set status='superseded' where id=?", (int(sys.argv[3]),))
+c.commit()
+EOF
+NOUT=$($M purge --now --reason 隐私)
+chk "G 前置：--now 只把没保护位的那条送进墓碑" "c.execute(\"select zone from nodes where id=$G2\").fetchone()[0]=='tombstone' and c.execute(\"select zone from nodes where id=$G1\").fetchone()[0]!='tombstone'"
+chk "保护位与活引用同时命中：正文仍在（--now 也不许带走）" "c.execute(\"select length(content) from blobs where addr=?\", ('$GADDR',)).fetchone()[0]>0"
+NGKP=$(echo "$NOUT" | jget skipped_pinned)
+NGKS=$(echo "$NOUT" | jget skipped_shared)
+gechk "$NGKP" 1 "计数归属：--now 重叠时优先计 skipped_pinned"
+chk "计数归属：--now 不重复计进 skipped_shared（这次是 0）" "'$NGKS'=='0'"
+
+# ---------- (9) 计数归属：apply 路径重叠时同样优先计 skipped_pinned ----------
+export MEMTREE_DB="$(mktemp -d)/mt_selftest12.db"
+$M init >/dev/null
+H1=$($M commit "共享正文：活引用与保护位撞一起" --type fact --subject h.a --source stated -q | tail -1)
+H2=$($M commit "共享正文：活引用与保护位撞一起" --type fact --subject h.b --source inferred -q | tail -1)
+$M commit "覆盖 h.b" --type fact --subject h.b -q >/dev/null
+$M purge >/dev/null
+HADDR=$(addr_of_id "$H1")
+"$PY" - "$MEMTREE_DB" "$H1" "$H2" <<'EOF'
+import sqlite3, sys, time
+c = sqlite3.connect(sys.argv[1])
+c.execute("update nodes set pinned=1 where id=?", (int(sys.argv[2]),))
+c.execute("update nodes set tombstoned_at=? where id=?", (time.time() - 8 * 86400, int(sys.argv[3])))
+c.commit()
+EOF
+HOUT=$($M purge --apply)
+HKP=$(echo "$HOUT" | jget skipped_pinned)
+HKS=$(echo "$HOUT" | jget skipped_shared)
+gechk "$HKP" 1 "计数归属：apply 重叠时优先计 skipped_pinned"
+chk "计数归属：apply 不重复计进 skipped_shared（这次是 0）" "'$HKS'=='0'"
+chk "计数归属：正文仍活着（H1 活引用 + H2 墓碑保护位）" "c.execute(\"select length(content) from blobs where addr=?\", ('$HADDR',)).fetchone()[0]>0"
+
 echo "通过 $PASS / 失败 $FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
